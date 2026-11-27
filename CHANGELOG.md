@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.5.0] - 2026-11-27
+
+### Added
+- Native Windows 10/11 support without WSL across all `cloud-dl` commands.
+- Pure-Python resumable SSH byte-stream sync backend (`--backend auto|rsync|ssh`) with exact byte-offset resume, ETA progress bar, and AWS IP refresh on retries (`rsync` on Linux, native SSH stream on Windows or when `rsync` is absent).
+- Cross-platform `cloud-dl browse` SOCKS5 tunnel launcher supporting Chrome, Microsoft Edge, Zen Browser, and Firefox with isolated profiles and PowerShell `$env:` output (`cloud-dl browse env` / `cloud-dl browse stop`).
+- Native Windows `ctypes` volume filesystem detection (`GetVolumeInformationW`), Windows process tracking (`taskkill` / `OpenProcess`), stdlib `zipfile` AriaNg extraction, `webbrowser.open` UI launcher, and `%APPDATA%` / `%LOCALAPPDATA%` path resolution.
+- Windows GitHub Actions CI matrix coverage (`windows-latest` + `ubuntu-latest` across Python 3.12, 3.13, and 3.14).
+
 ## [2.4.0] - 2026-11-27
 
 ### Added

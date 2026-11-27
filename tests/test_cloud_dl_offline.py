@@ -243,7 +243,8 @@ def test_cmd_init_writes_0600_config_with_random_secret(tmp_path: Path) -> None:
     )
     config.cmd_init(args)
     assert cfg_file.is_file()
-    assert (cfg_file.stat().st_mode & 0o777) == 0o600
+    if os.name != "nt":
+        assert (cfg_file.stat().st_mode & 0o777) == 0o600
     saved = json.loads(cfg_file.read_text(encoding="utf-8"))
     assert saved["aws"]["instance_id"] == "i-abc12345"
     assert saved["aws"]["region"] == "us-west-2"
@@ -258,14 +259,14 @@ def test_cmd_doctor_reports_health_summary(tmp_path: Path, capsys: pytest.Captur
         ),
         encoding="utf-8",
     )
-    os.chmod(cfg_file, 0o600)
+    if os.name != "nt":
+        os.chmod(cfg_file, 0o600)
     reset_test_cfg(cfg_file)
     with (
         patch.object(doctor, "get_aws_state", return_value="stopped"),
         patch.object(doctor.os.path, "ismount", return_value=True),
-        patch.object(
-            doctor.subprocess, "run", return_value=subprocess.CompletedProcess(["systemctl"], 0, "active\n", "")
-        ),
+        patch.object(doctor.shutil, "which", return_value="ok"),
+        patch.object(doctor, "_is_local_port_open", return_value=True),
         patch.object(doctor, "query_status_payload", return_value=([], [], [], "", None)),
     ):
         doctor.cmd_doctor(None)
@@ -277,10 +278,11 @@ def test_cmd_doctor_reports_health_summary(tmp_path: Path, capsys: pytest.Captur
 def test_ssh_controlmaster_args_and_socket_reset_on_ip_rotation() -> None:
     reset_test_cfg()
     config.CFG["aws"]["instance_id"] = "i-test0001"
-    args_list = ssh.build_ssh_base_args()
-    joined = " ".join(args_list)
-    assert "ControlMaster=auto" in joined
-    assert "ControlPersist=300" in joined
+    with patch.object(ssh.sys, "platform", "linux"):
+        args_list = ssh.build_ssh_base_args()
+        joined = " ".join(args_list)
+        assert "ControlMaster=auto" in joined
+        assert "ControlPersist=300" in joined
 
     calls: list[list[str]] = []
 
@@ -291,6 +293,7 @@ def test_ssh_controlmaster_args_and_socket_reset_on_ip_rotation() -> None:
         return subprocess.CompletedProcess(cmd, 1 if len([c for c in calls if "-O" not in c]) == 1 else 0, "ok\n", "")
 
     with (
+        patch.object(ssh.sys, "platform", "linux"),
         patch.object(aws, "get_aws_state", return_value="running"),
         patch.object(aws, "get_aws_public_ip", return_value="203.0.113.77"),
         patch.object(ssh, "update_ssh_config_ip", return_value=True),
@@ -303,6 +306,14 @@ def test_ssh_controlmaster_args_and_socket_reset_on_ip_rotation() -> None:
     assert any("-O" in c and "exit" in c for c in calls)
 
 
+def test_windows_ssh_base_args_omit_controlmaster() -> None:
+    with patch.object(ssh.sys, "platform", "win32"):
+        args_list = ssh.build_ssh_base_args()
+        joined = " ".join(args_list)
+        assert "ControlMaster" not in joined
+        assert "ControlPath" not in joined
+
+
 def test_ui_tunnel_stop_kills_tracked_pid_without_pkill(tmp_path: Path) -> None:
     tunnel_file = tmp_path / "ui-tunnel.json"
     tunnel_file.write_text(
@@ -311,9 +322,32 @@ def test_ui_tunnel_stop_kills_tracked_pid_without_pkill(tmp_path: Path) -> None:
     os.environ["CLOUD_DL_TUNNEL_STATE"] = str(tunnel_file)
     try:
         args = cli.build_parser().parse_args(["ui", "--stop"])
-        with patch.object(doctor.os, "kill") as mock_kill:
+        with patch.object(doctor.sys, "platform", "linux"), patch.object(doctor.os, "kill") as mock_kill:
             doctor.cmd_ui(args)
         mock_kill.assert_called_once_with(43210, signal.SIGTERM)
+        assert not tunnel_file.exists()
+    finally:
+        os.environ.pop("CLOUD_DL_TUNNEL_STATE", None)
+
+
+def test_windows_tunnel_stop_uses_taskkill(tmp_path: Path) -> None:
+    tunnel_file = tmp_path / "ui-tunnel.json"
+    tunnel_file.write_text(
+        json.dumps({"pid": 54321, "cloud": "aws", "host": "aws-vps", "port": 6800}), encoding="utf-8"
+    )
+    os.environ["CLOUD_DL_TUNNEL_STATE"] = str(tunnel_file)
+    try:
+        args = cli.build_parser().parse_args(["ui", "--stop"])
+        with (
+            patch.object(doctor.sys, "platform", "win32"),
+            patch.object(
+                doctor.subprocess, "run", return_value=subprocess.CompletedProcess(["taskkill"], 0, "", "")
+            ) as mock_run,
+        ):
+            doctor.cmd_ui(args)
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:4] == ["taskkill", "/PID", "54321", "/T"]
         assert not tunnel_file.exists()
     finally:
         os.environ.pop("CLOUD_DL_TUNNEL_STATE", None)
@@ -335,8 +369,109 @@ def test_build_rsync_command_exfat_and_append_flags() -> None:
 def test_sync_unmounted_preferred_target_raises_sync_error() -> None:
     reset_test_cfg()
     with (
+        patch.object(sync.sys, "platform", "linux"),
         patch.object(sync.os.path, "ismount", return_value=False),
         patch.object(sync.os.path, "exists", return_value=False),
         pytest.raises(exceptions.SyncError),
     ):
         sync.ensure_local_dest_mounted("/mnt/DATA")
+
+
+def test_resolve_sync_backend_selects_ssh_on_windows_and_when_rsync_missing() -> None:
+    with patch.object(sync.sys, "platform", "win32"), patch.object(sync.shutil, "which", return_value=None):
+        assert sync.resolve_sync_backend("auto") == "ssh"
+        with pytest.raises(exceptions.SyncError):
+            sync.resolve_sync_backend("rsync")
+    with patch.object(sync.sys, "platform", "linux"), patch.object(sync.shutil, "which", return_value="/usr/bin/rsync"):
+        assert sync.resolve_sync_backend("auto") == "rsync"
+        assert sync.resolve_sync_backend("ssh") == "ssh"
+
+
+def test_ssh_stream_sync_resumes_partial_file_after_transient_drop(tmp_path: Path) -> None:
+    dest_dir = tmp_path / "out"
+    dest_dir.mkdir()
+    partial = dest_dir / "pkg" / "movie.bin"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"hello ")
+    full_payload = b"hello world!"
+
+    manifest = json.dumps([{"rel": "pkg/movie.bin", "size": len(full_payload), "remote": "/dl/pkg/movie.bin"}])
+    call_count = 0
+
+    class _FakeProc:
+        def __init__(self, data: bytes, rc: int) -> None:
+            import io
+
+            self.stdout = io.BytesIO(data)
+            self.stderr = io.BytesIO(b"drop" if rc else b"")
+            self._rc = rc
+
+        def wait(self) -> int:
+            return self._rc
+
+    def fake_popen(cmd, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        assert "python3 -c" in cmd[-1]
+        if call_count == 1:
+            assert f" {len(b'hello ')}" in cmd[-1]
+            return _FakeProc(b"wo", 255)
+        assert f" {len(b'hello wo')}" in cmd[-1]
+        return _FakeProc(b"rld!", 0)
+
+    with (
+        patch.object(sync, "run_ssh", return_value=(0, manifest, "")),
+        patch.object(sync.subprocess, "Popen", side_effect=fake_popen),
+        patch.object(sync.time, "sleep"),
+    ):
+        sync._run_ssh_stream_with_retries("aws-vps", "oci", "/dl", "pkg", str(dest_dir), 3)
+
+    assert partial.read_bytes() == full_payload
+    assert call_count == 2
+
+
+def test_ariang_bundle_uses_stdlib_zipfile(tmp_path: Path) -> None:
+    import zipfile
+
+    zip_src = tmp_path / "src.zip"
+    with zipfile.ZipFile(zip_src, "w") as zf:
+        zf.writestr("index.html", "<html>AriaNg</html>")
+
+    out_html = tmp_path / "ui" / "index.html"
+
+    def fake_retrieve(_url: str, dst: str) -> tuple[str, None]:
+        Path(dst).write_bytes(zip_src.read_bytes())
+        return dst, None
+
+    with patch.object(doctor.urllib.request, "urlretrieve", side_effect=fake_retrieve):
+        doctor._ensure_ariang_bundle(out_html)
+
+    assert out_html.read_text(encoding="utf-8") == "<html>AriaNg</html>"
+
+
+def test_browse_env_outputs_powershell_on_windows(capsys: pytest.CaptureFixture[str]) -> None:
+    reset_test_cfg()
+    args = cli.build_parser().parse_args(["browse", "env"])
+    with patch.object(doctor.sys, "platform", "win32"), patch.object(doctor, "_ensure_socks_tunnel"):
+        doctor.cmd_browse(args)
+    out = capsys.readouterr().out
+    assert '$env:ALL_PROXY = "socks5h://127.0.0.1:1080"' in out
+
+
+def test_browse_launches_edge_with_socks5_and_isolated_profile(tmp_path: Path) -> None:
+    reset_test_cfg()
+    args = cli.build_parser().parse_args(["browse", "edge", "https://example.com"])
+    with (
+        patch.object(doctor, "_ensure_socks_tunnel"),
+        patch.object(doctor, "get_cache_dir", return_value=tmp_path),
+        patch.object(doctor, "_find_browser_binary", return_value="msedge.exe"),
+        patch.object(doctor, "_popen_detached") as mock_popen,
+    ):
+        doctor.cmd_browse(args)
+
+    mock_popen.assert_called_once()
+    launched_cmd = mock_popen.call_args.args[0]
+    assert launched_cmd[0] == "msedge.exe"
+    assert "--proxy-server=socks5://127.0.0.1:1080" in launched_cmd
+    assert any(arg.startswith("--user-data-dir=") for arg in launched_cmd)
+    assert "https://example.com" in launched_cmd

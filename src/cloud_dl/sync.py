@@ -1,29 +1,97 @@
-"""Resilient rsync sync, exFAT tuning, remote cleanup, and checksum verification."""
+"""Resilient rsync and SSH byte-stream sync, filesystem tuning, cleanup, and checksum verification."""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
+import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 import zlib
 from pathlib import Path
+from typing import IO
 
 from .aws import get_aws_public_ip, get_aws_state, require_aws_auth, start_aws_instance, stop_aws_instance
-from .config import Terminal, get_cfg, log_err, log_info, log_ok, log_warn, send_notification
+from .config import (
+    Terminal,
+    format_size,
+    format_speed,
+    format_time,
+    get_cfg,
+    log_err,
+    log_info,
+    log_ok,
+    log_warn,
+    send_notification,
+)
 from .exceptions import CloudDlError, SyncError
 from .rpc import resolve_cloud
-from .ssh import close_ssh_control_socket, run_ssh, update_ssh_config_ip
+from .ssh import build_ssh_base_args, close_ssh_control_socket, run_ssh, update_ssh_config_ip
 
 TRANSIENT_RSYNC_CODES = {12, 30, 35, 255}
 RSYNC_SSH_CMD = "ssh -c aes128-gcm@openssh.com -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -o TCPKeepAlive=yes"
+SSH_STREAM_CHUNK_BYTES = 262_144
+
+_REMOTE_LIST_SCRIPT = (
+    "import json,os,sys\n"
+    "root,item=sys.argv[1],sys.argv[2]\n"
+    "t=os.path.join(root,item) if item else root\n"
+    "out=[]\n"
+    "if os.path.isfile(t):\n"
+    "    out=[{'rel':os.path.basename(t),'size':os.path.getsize(t),'remote':t}]\n"
+    "elif os.path.isdir(t):\n"
+    "    base=os.path.dirname(t.rstrip('/')) if item else t.rstrip('/')\n"
+    "    for dp,_,fns in os.walk(t,followlinks=True):\n"
+    "        for fn in sorted(fns):\n"
+    "            fp=os.path.join(dp,fn)\n"
+    "            if os.path.isfile(fp):\n"
+    "                out.append({'rel':os.path.relpath(fp,base).replace(os.sep,'/'),'size':os.path.getsize(fp),'remote':fp})\n"
+    "print(json.dumps(out))\n"
+)
+
+_REMOTE_READ_SCRIPT = (
+    "import shutil,sys\n"
+    "p,off=sys.argv[1],int(sys.argv[2])\n"
+    "with open(p,'rb') as f:\n"
+    "    f.seek(off)\n"
+    "    shutil.copyfileobj(f,sys.stdout.buffer,1048576)\n"
+)
+
+
+class _TransientStreamError(SyncError):
+    """Raised when an SSH byte-stream transfer drops cleanly mid-file and can be retried."""
+
+
+def _get_windows_filesystem_type(path: str) -> str:
+    anchor = Path(path).resolve().anchor
+    if not anchor:
+        return ""
+    fs_buf = ctypes.create_unicode_buffer(64)
+    kernel32 = getattr(ctypes, "windll", None)
+    if kernel32 is None:
+        return ""
+    ok = kernel32.kernel32.GetVolumeInformationW(
+        ctypes.c_wchar_p(anchor),
+        None,
+        0,
+        None,
+        None,
+        None,
+        fs_buf,
+        len(fs_buf),
+    )
+    return fs_buf.value.strip().lower() if ok else ""
 
 
 def get_filesystem_type(path: str) -> str:
-    """Detect destination filesystem type cleanly via findmnt."""
+    """Detect destination filesystem type cleanly across Windows and POSIX."""
+    if sys.platform == "win32":
+        return _get_windows_filesystem_type(path)
     probe = path if os.path.exists(path) else os.path.dirname(path) or "/"
     res = subprocess.run(
         ["findmnt", "-n", "-o", "FSTYPE", "-T", probe],
@@ -35,41 +103,63 @@ def get_filesystem_type(path: str) -> str:
     return res.stdout.strip().lower() if res.returncode == 0 else ""
 
 
+def _resolve_windows_dest(dest_override: str | None, preferred: str) -> str:
+    downloads = str(Path.home() / "Downloads")
+    target = dest_override or preferred or downloads
+    drive = Path(target).drive
+    if drive and not os.path.exists(f"{drive}\\"):
+        if dest_override:
+            raise SyncError(f"Destination drive '{drive}' is not connected.")
+        log_warn(f"Preferred drive '{drive}' is not available; falling back to '{downloads}'.")
+        return downloads
+    return target
+
+
+def _try_posix_mount(preferred: str) -> None:
+    dev_by_label = "/dev/disk/by-label/DATA"
+    if not os.path.exists(dev_by_label):
+        return
+    log_info(f"'{preferred}' is not mounted. Attempting automatic mount...")
+    res = subprocess.run(
+        ["udisksctl", "mount", "-b", os.path.realpath(dev_by_label), "--no-user-interaction"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if res.returncode != 0 or not os.path.ismount(preferred):
+        subprocess.run(["sudo", "-n", "mount", preferred], check=False, capture_output=True, timeout=15)
+    if os.path.ismount(preferred):
+        log_ok(f"Mounted external volume at '{preferred}'.")
+
+
+def _prompt_posix_fallback(preferred: str, dest_override: str | None) -> str:
+    if dest_override == preferred:
+        raise SyncError(f"Destination '{preferred}' is not mounted. Mount the drive first.")
+    fallback = os.path.expanduser("~/Downloads")
+    log_warn(f"Preferred drive '{preferred}' is not mounted; fallback is '{fallback}'.")
+    if sys.stdin.isatty():
+        try:
+            ans = input(f"Proceed writing to '{fallback}' instead? [y/N]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError) as exc:
+            raise CloudDlError("Operation aborted.") from exc
+        if ans not in ["y", "yes"]:
+            raise SyncError("Sync aborted because preferred drive is not mounted.")
+    return fallback
+
+
 def ensure_local_dest_mounted(dest_override: str | None) -> str:
-    """Resolve destination path, mounting the preferred external volume if needed."""
+    """Resolve destination path, mounting the preferred external volume on POSIX if needed."""
     cfg = get_cfg()
-    preferred = cfg.get("preferred_local_dir", "/mnt/DATA")
+    preferred = cfg.get("preferred_local_dir", str(Path.home() / "Downloads"))
+    if sys.platform == "win32":
+        return _resolve_windows_dest(dest_override, preferred)
+
     wants_preferred = dest_override in (None, preferred)
-
     if wants_preferred and preferred and not os.path.ismount(preferred):
-        dev_by_label = "/dev/disk/by-label/DATA"
-        if os.path.exists(dev_by_label):
-            log_info(f"'{preferred}' is not mounted. Attempting automatic mount...")
-            res = subprocess.run(
-                ["udisksctl", "mount", "-b", os.path.realpath(dev_by_label), "--no-user-interaction"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if res.returncode != 0 or not os.path.ismount(preferred):
-                subprocess.run(["sudo", "-n", "mount", preferred], check=False, capture_output=True, timeout=15)
-            if os.path.ismount(preferred):
-                log_ok(f"Mounted external volume at '{preferred}'.")
-
+        _try_posix_mount(preferred)
         if not os.path.ismount(preferred):
-            if dest_override == preferred:
-                raise SyncError(f"Destination '{preferred}' is not mounted. Mount the drive first.")
-            fallback = os.path.expanduser("~/Downloads")
-            log_warn(f"Preferred drive '{preferred}' is not mounted; fallback is '{fallback}'.")
-            if sys.stdin.isatty():
-                try:
-                    ans = input(f"Proceed writing to '{fallback}' instead? [y/N]: ").strip().lower()
-                except (KeyboardInterrupt, EOFError) as exc:
-                    raise CloudDlError("Operation aborted.") from exc
-                if ans not in ["y", "yes"]:
-                    raise SyncError("Sync aborted because preferred drive is not mounted.")
-            return fallback
+            return _prompt_posix_fallback(preferred, dest_override)
 
     return dest_override or preferred or os.path.expanduser("~/Downloads")
 
@@ -195,6 +285,20 @@ def _select_remote_sync_item(host: str, remote_dl_dir: str) -> str | None:
         raise SyncError("Invalid selection index.") from exc
 
 
+def resolve_sync_backend(backend_arg: str) -> str:
+    """Choose between rsync and pure-Python SSH stream backend cleanly."""
+    if backend_arg == "ssh":
+        return "ssh"
+    has_rsync = shutil.which("rsync") is not None
+    if backend_arg == "rsync":
+        if not has_rsync:
+            raise SyncError("Requested '--backend rsync', but 'rsync' is not installed on PATH. Use '--backend ssh'.")
+        return "rsync"
+    if sys.platform == "win32" or not has_rsync:
+        return "ssh"
+    return "rsync"
+
+
 def build_rsync_command(
     src: str,
     dest_dir: str,
@@ -218,6 +322,151 @@ def build_rsync_command(
     ]
 
 
+def _parse_remote_manifest(raw_json: str, dest_root: Path) -> list[tuple[Path, int, str]]:
+    entries = json.loads(raw_json or "[]")
+    if not isinstance(entries, list):
+        raise SyncError("Remote file listing returned unexpected format.")
+    resolved_root = dest_root.resolve()
+    result: list[tuple[Path, int, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        rel = str(entry.get("rel", "")).replace("\\", "/").lstrip("/")
+        remote_fp = str(entry.get("remote", ""))
+        size = int(entry.get("size", 0))
+        if not rel or ".." in Path(rel).parts or not remote_fp:
+            raise SyncError(f"Unsafe relative path returned by remote host: '{rel}'")
+        local_target = (resolved_root / rel).resolve()
+        if not local_target.is_relative_to(resolved_root):
+            raise SyncError(f"Path traversal rejected in remote manifest: '{rel}'")
+        result.append((local_target, size, remote_fp))
+    return result
+
+
+def _list_remote_files_ssh(host: str, remote_dl_dir: str, item: str, dest_root: Path) -> list[tuple[Path, int, str]]:
+    cmd = f"python3 -c {shlex.quote(_REMOTE_LIST_SCRIPT)} {shlex.quote(remote_dl_dir)} {shlex.quote(item)}"
+    code, stdout, stderr = run_ssh(host, cmd, timeout=30)
+    if code != 0:
+        raise _TransientStreamError(f"Failed to list remote files (exit {code}): {stderr.strip()}")
+    return _parse_remote_manifest(stdout, dest_root)
+
+
+def _render_stream_progress(label: str, done: int, total: int, elapsed: float) -> None:
+    if not Terminal.IS_TTY:
+        return
+    pct = min(100, int((done / total) * 100)) if total > 0 else 100
+    rate = done / elapsed if elapsed > 0 else 0
+    eta = format_time(int((total - done) / rate)) if rate > 0 and done < total else "0s"
+    line = (
+        f"\r[SYNC] {label}: {format_size(done)} / {format_size(total)} ({pct}%) | {format_speed(rate)} | ETA {eta}   "
+    )
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+def _copy_stream_to_file(
+    stdout_pipe: IO[bytes],
+    dest_fh: IO[bytes],
+    label: str,
+    offset: int,
+    remote_size: int,
+) -> int:
+    written = 0
+    t_start = time.monotonic()
+    last_print = 0.0
+    while chunk := stdout_pipe.read(SSH_STREAM_CHUNK_BYTES):
+        dest_fh.write(chunk)
+        written += len(chunk)
+        now = time.monotonic()
+        if now - last_print >= 0.4:
+            _render_stream_progress(label, offset + written, remote_size, now - t_start)
+            last_print = now
+    dest_fh.flush()
+    if Terminal.IS_TTY:
+        _render_stream_progress(label, offset + written, remote_size, max(0.01, time.monotonic() - t_start))
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    return written
+
+
+def _stream_single_file_ssh(host: str, remote_fp: str, local_path: Path, remote_size: int, rel_label: str) -> None:
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_size = local_path.stat().st_size if local_path.is_file() else 0
+    if local_size == remote_size:
+        log_ok(f"Already synced: {rel_label} ({format_size(remote_size)})")
+        return
+
+    offset = local_size if 0 < local_size < remote_size else 0
+    mode = "ab" if offset > 0 else "wb"
+    if remote_size == 0:
+        local_path.touch()
+        log_ok(f"Created empty file: {rel_label}")
+        return
+
+    action = "Resuming" if offset > 0 else "Downloading"
+    log_info(f"{action} {rel_label} from byte {format_size(offset)} / {format_size(remote_size)}...")
+    remote_cmd = f"python3 -c {shlex.quote(_REMOTE_READ_SCRIPT)} {shlex.quote(remote_fp)} {offset}"
+    ssh_cmd = [
+        *build_ssh_base_args(),
+        "-T",
+        "-c",
+        "aes128-gcm@openssh.com",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=6",
+        host,
+        remote_cmd,
+    ]
+    proc = subprocess.Popen(ssh_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.stdout is None or proc.stderr is None:
+        raise SyncError("Failed to attach stdout/stderr pipes to SSH stream process.")
+    with open(local_path, mode) as fh:
+        _copy_stream_to_file(proc.stdout, fh, rel_label, offset, remote_size)
+    err_out = proc.stderr.read().decode("utf-8", errors="replace").strip()
+    rc = proc.wait()
+    final_size = local_path.stat().st_size if local_path.is_file() else 0
+    if rc != 0 or final_size != remote_size:
+        raise _TransientStreamError(
+            f"Stream interrupted for '{rel_label}' ({final_size}/{remote_size} bytes, exit {rc}: {err_out})"
+        )
+
+
+def _refresh_aws_connection(cloud: str, host: str) -> None:
+    if cloud == "aws" and get_aws_state() == "running":
+        new_ip = get_aws_public_ip()
+        if new_ip and update_ssh_config_ip(host, new_ip):
+            close_ssh_control_socket(host)
+
+
+def _run_ssh_stream_with_retries(
+    host: str,
+    cloud: str,
+    remote_dl_dir: str,
+    item: str,
+    dest_dir: str,
+    max_attempts: int,
+) -> None:
+    dest_root = Path(dest_dir)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            files = _list_remote_files_ssh(host, remote_dl_dir, item, dest_root)
+            if not files:
+                log_warn("No remote files matched target.")
+                return
+            for local_path, remote_size, remote_fp in files:
+                rel_label = str(local_path.relative_to(dest_root.resolve()))
+                _stream_single_file_ssh(host, remote_fp, local_path, remote_size, rel_label)
+            return
+        except _TransientStreamError as exc:
+            if attempt >= max_attempts:
+                raise SyncError(str(exc)) from exc
+            wait_s = min(60, 5 * attempt)
+            log_warn(f"{exc} Retrying in {wait_s}s ({attempt}/{max_attempts})...")
+            time.sleep(wait_s)
+            _refresh_aws_connection(cloud, host)
+
+
 def _run_rsync_with_retries(rsync_cmd: list[str], cloud: str, host: str, max_attempts: int) -> int:
     ret_code = 1
     for attempt in range(1, max_attempts + 1):
@@ -233,10 +482,7 @@ def _run_rsync_with_retries(rsync_cmd: list[str], cloud: str, host: str, max_att
             f"Refreshing connection and retrying in {wait_s}s..."
         )
         time.sleep(wait_s)
-        if cloud == "aws" and get_aws_state() == "running":
-            new_ip = get_aws_public_ip()
-            if new_ip and update_ssh_config_ip(host, new_ip):
-                close_ssh_control_socket(host)
+        _refresh_aws_connection(cloud, host)
     return ret_code
 
 
@@ -297,23 +543,24 @@ def cmd_sync(args: argparse.Namespace) -> None:
             return
 
     dest_dir = ensure_local_dest_mounted(args.dest)
-    if not os.path.exists(dest_dir):
-        log_info(f"Creating local directory '{dest_dir}'...")
-        os.makedirs(dest_dir, exist_ok=True)
-
+    os.makedirs(dest_dir, exist_ok=True)
     fstype = get_filesystem_type(dest_dir)
-    is_fat = fstype in {"exfat", "vfat", "msdos"}
-    use_append = bool(getattr(args, "append", False))
-
+    backend = resolve_sync_backend(getattr(args, "backend", "auto"))
     remote_path = f"{cfg['remote_dl_dir'].rstrip('/')}/{item}" if item else f"{cfg['remote_dl_dir'].rstrip('/')}/"
-    src = f"{host}:{remote_path}"
-    log_info(f"Syncing from {cfg[cloud]['name']} to {dest_dir} (fs: {fstype or 'unknown'})...")
-    sys.stdout.write(f"Source: {src}\nTarget: {dest_dir}/\n")
+    max_attempts = max(1, int(args.retries) + 1)
 
-    rsync_cmd = build_rsync_command(src, dest_dir, is_fat=is_fat, append=use_append)
-    ret_code = _run_rsync_with_retries(rsync_cmd, cloud, host, max(1, int(args.retries) + 1))
-    if ret_code != 0:
-        raise SyncError(f"rsync failed with exit code {ret_code}. Remote files were preserved.")
+    log_info(f"Syncing from {cfg[cloud]['name']} to {dest_dir} (backend: {backend}, fs: {fstype or 'unknown'})...")
+    sys.stdout.write(f"Source: {host}:{remote_path}\nTarget: {dest_dir}{os.sep}\n")
+
+    if backend == "ssh":
+        _run_ssh_stream_with_retries(host, cloud, cfg["remote_dl_dir"], item, dest_dir, max_attempts)
+    else:
+        is_fat = fstype in {"exfat", "vfat", "msdos", "fat32"}
+        use_append = bool(getattr(args, "append", False))
+        rsync_cmd = build_rsync_command(f"{host}:{remote_path}", dest_dir, is_fat=is_fat, append=use_append)
+        ret_code = _run_rsync_with_retries(rsync_cmd, cloud, host, max_attempts)
+        if ret_code != 0:
+            raise SyncError(f"rsync failed with exit code {ret_code}. Remote files were preserved.")
 
     log_ok("Synchronization completed successfully.")
     if getattr(args, "verify", False):

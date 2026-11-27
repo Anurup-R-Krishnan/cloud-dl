@@ -1,11 +1,11 @@
 # cloud-dl: Personal Multi-Cloud Download Engine & Network Bypass Toolkit
 
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Hyprland%20%7C%20Arch-blue.svg)](https://archlinux.org/)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%2010%2F11%20(No%20WSL)-blue.svg)](https://github.com/Anurup-R-Krishnan/cloud-dl)
+[![Python](https://img.shields.io/badge/Python-3.12%2B-brightgreen.svg)](https://www.python.org/)
 [![Cloud](https://img.shields.io/badge/Cloud-AWS%20Sydney%20%7C%20OCI%20Hyderabad-orange.svg)](https://aws.amazon.com/)
 [![Engine](https://img.shields.io/badge/Engine-Aria2c%20Daemon%20%2B%20AriaNg%20UI-purple.svg)](https://aria2.github.io/)
 [![Security](https://img.shields.io/badge/Security-Encrypted%20SSH%20Tunnel%20%28Zero%20Open%20Ports%29-red.svg)](#security--architecture)
-[![Regression Tests](https://img.shields.io/badge/Tests-41%2F41%20Passed%20%28100%25%29-success.svg)](#test-suites--verification)
+[![CI](https://img.shields.io/github/actions/workflow/status/Anurup-R-Krishnan/cloud-dl/ci.yml?label=CI%20Linux%20%2B%20Windows)](.github/workflows/ci.yml)
 
 cloud-dl is a personal multi-cloud downloading engine, uncensored general browsing suite, and campus network bypass toolkit. It allows you to download torrents, magnet links, and large direct files into high-speed cloud VPS nodes (bursting up to 5 Gbps on AWS or 10 TB free egress on Oracle Cloud), monitor progress via CLI or browser Web UI, sync completed files directly to your external hard drive with resume capability, and browse the web without campus firewall restrictions or DNS leaks.
 
@@ -17,7 +17,7 @@ cloud-dl is a personal multi-cloud downloading engine, uncensored general browsi
 - [Key Capabilities](#key-capabilities)
 - [Quick Start & Installation](#quick-start--installation)
 - [CLI Reference: `cloud-dl`](#cli-reference-cloud-dl)
-- [General Browsing Suite: `oci-browse`](#general-browsing-suite-oci-browse)
+- [General Browsing Suite: `cloud-dl browse`](#general-browsing-suite-cloud-dl-browse)
 - [Intelligent Watchdog v2 (Auto-Shutdown)](#intelligent-watchdog-v2-auto-shutdown)
 - [Hardware & Storage Recovery (1TB HDD Fix)](#hardware--storage-recovery-1tb-hdd-fix)
 - [Test Suites & Verification](#test-suites--verification)
@@ -32,11 +32,11 @@ cloud-dl is a personal multi-cloud downloading engine, uncensored general browsi
 
 ```mermaid
 flowchart TD
-    subgraph Client ["Laptop (Arch Linux / Hyprland)"]
+    subgraph Client ["Client Laptop (Linux or Native Windows 10/11 - Zero WSL)"]
         CLI["CLI: cloud-dl"]
         WebUI["AriaNg Web Dashboard (localhost:6800)"]
-        Sync["rsync -avh -P -s Engine"]
-        HDD["Local Target: /mnt/DATA/ (1TB Toshiba HDD)"]
+        Sync["rsync (Linux) or SSH Byte-Stream Resume (Windows)"]
+        HDD["Local Target: /mnt/DATA/ or C:\\Users\\...\\Downloads"]
     end
 
     subgraph Tunnel ["Encrypted SSH Tunnel (Port 22)"]
@@ -90,27 +90,51 @@ flowchart LR
 - **Live Terminal Monitor (`cloud-dl top`)**: Interactive real-time curses monitor displaying visual progress bars, peer/seeder counts, speeds, and ETA.
 - **AriaNg Web Dashboard (`cloud-dl ui`)**: Single-file, zero-overhead browser UI running via loopback SSH tunnel on `localhost:6800`.
 
-### 3. General Browsing (`oci-browse`)
-- **Zero DNS Leaks**: Remote DNS resolution directly on OCI datacenter resolvers bypasses campus DNS sinkholing.
-- **Zero Warning Banners**: Uses clean HTTP/HTTPS proxying on `127.0.0.1:8888` without triggering Chromium's "unsupported command-line flag" security banners.
-- **Isolated Profiles**: Keeps proxy sessions separated in `~/.config/google-chrome-oci` so everyday browser data remains untouched.
-- **Desktop Integration**: Includes an `oci-browse.desktop` shortcut for application launchers (rofi, wofi) in Hyprland.
+### 3. General Browsing (`cloud-dl browse`)
+- **Zero WSL / Zero Extra Tools on Windows**: Automatically opens a SOCKS5 SSH tunnel (`127.0.0.1:1080`) using built-in Windows OpenSSH and launches Edge, Chrome, Zen, or Firefox in an isolated profile.
+- **Zero DNS Leaks**: Enforces remote SOCKS5 hostname resolution (`MAP * ~NOTFOUND` in Chrome/Edge, `socks_remote_dns=true` in Firefox/Zen) so campus DNS filters never see your queries.
+- **Isolated Profiles**: Keeps proxy sessions separated in `%LOCALAPPDATA%\cloud-dl\browser-<name>` (Windows) or `~/.cache/cloud-dl/browser-<name>` (Linux).
 
 ---
 
 ## Quick Start & Installation
 
-### 1. Clone, Install, & Initialize
+### Option A: Windows 10 / 11 (Zero WSL, PowerShell Guide)
+
+No WSL, Git Bash, or Ubuntu terminal required. Open **PowerShell** and run:
+
+```powershell
+# 1. Install Python 3.13, uv, and AWS CLI v2 (only needed once; OpenSSH is already built into Windows 10/11)
+winget install Python.Python.3.13 astral-sh.uv Amazon.AWSCLI
+
+# Restart PowerShell so PATH updates take effect, then install cloud-dl directly from GitHub:
+uv tool install git+https://github.com/Anurup-R-Krishnan/cloud-dl.git
+
+# 2. Place your SSH private key + config into C:\Users\<YourName>\.ssh\config
+# (See configs/ssh_config_snippet.txt; uses built-in Windows ssh.exe)
+
+# 3. Run first-time setup and diagnostics:
+cloud-dl init
+cloud-dl doctor
+
+# 4. Everyday commands (all native in PowerShell):
+cloud-dl browse edge              # Browse via OCI SOCKS5 proxy in an isolated Edge window
+cloud-dl add "magnet:?xt=..."     # Queue download in the cloud
+cloud-dl ui                       # Open AriaNg web dashboard in your default browser
+cloud-dl sync "Package Name" --dest "D:\Downloads" --verify --stop-after
+```
+
+`cloud-dl sync` automatically selects the built-in resumable SSH byte-stream backend on Windows (resuming partial files at exact byte offsets if Wi-Fi drops, with zero `rsync` or WSL needed).
+
+### Option B: Linux (Arch / Ubuntu / macOS)
 
 ```bash
 # Clone the repository
 git clone https://github.com/Anurup-R-Krishnan/cloud-dl.git ~/.local/share/cloud-dl-repo
 cd ~/.local/share/cloud-dl-repo
 
-# Install editable CLI package via uv and link oci-browse
+# Install editable CLI package via uv
 uv tool install --editable .
-ln -sf ~/.local/share/cloud-dl-repo/scripts/oci-browse ~/.local/bin/oci-browse
-chmod +x ~/.local/bin/oci-browse
 
 # Generate ~/.config/cloud-dl/config.json (0600 permissions, random 32-char RPC secret)
 cloud-dl init
@@ -180,7 +204,7 @@ usage: cloud-dl [-h] {add,status,top,list,sync,clean,limit,extract,test,speed,co
 | `add -f` | `-f <file.txt>` | Queues multiple URLs/magnets in batch from a text file.<br>`cloud-dl add -f queue.txt --cloud aws` |
 | `status` | `[--cloud aws\|oci]` | Displays active downloads, ETA, speeds, and free disk space.<br>`cloud-dl status` |
 | `top` | `[--cloud aws\|oci]` | Interactive auto-refreshing monitor (refreshes every 2s; Ctrl+C to exit).<br>`cloud-dl top` |
-| `sync` | `[name] [--dest path]` | Syncs completed files to `/mnt/DATA/` with `rsync -avh -P -s`.<br>`cloud-dl sync "Package Name" --dest "/mnt/DATA"` |
+| `sync` | `[name] [--dest path]` | Syncs completed files using `rsync` (Linux) or resumable SSH byte-stream (Windows/no-WSL).<br>`cloud-dl sync "Package Name" --dest "/mnt/DATA" --verify --stop-after` |
 | `limit` | `[--down 10M] [--up 1M]` | Inspects or adjusts global upload/download bandwidth limits.<br>`cloud-dl limit --down 8M --up 50K` |
 | `extract` | `<archive>` | Remotely extracts `.zip`, `.tar.gz`, `.7z`, or `.rar` archives on the VPS.<br>`cloud-dl extract "release.7z"` |
 | `test` | None | Benchmarks SSH latency and pipe responsiveness across both clouds.<br>`cloud-dl test` |
@@ -193,40 +217,27 @@ usage: cloud-dl [-h] {add,status,top,list,sync,clean,limit,extract,test,speed,co
 
 ---
 
-## General Browsing Suite: `oci-browse`
+## General Browsing Suite: `cloud-dl browse`
 
-The `oci-browse` utility routes browser and CLI traffic through your uncensored Oracle Cloud instance in Hyderabad:
+`cloud-dl browse` works natively on Windows (PowerShell), macOS, and Linux without WSL or extra shell scripts:
 
-### 1. Launch Google Chrome
-```bash
-# Opens Chrome in an isolated proxy profile with zero warning banners:
-oci-browse chrome https://google.com
-```
-
-### 2. Launch Zen Browser / Firefox
-```bash
-# Launches Zen Browser routed through OCI:
-oci-browse zen
-```
-
-### 3. Check Proxy Status & Egress IP
-```bash
-oci-browse status
-```
-*Sample Output:*
 ```text
-=================================================================
- OCI VPS General Browsing & Proxy Status
-=================================================================
-* SOCKS5 Tunnel (127.0.0.1:1080): ONLINE (Egress: 203.0.113.10 - Oracle Cloud)
-* HTTP/HTTPS Proxy (127.0.0.1:8888): ONLINE (Egress: 203.0.113.10 - Oracle Cloud)
-=================================================================
+cloud-dl browse chrome [url]   # Launch isolated Chrome via OCI SOCKS5
+cloud-dl browse edge [url]     # Launch isolated Microsoft Edge (built into Windows 10/11)
+cloud-dl browse zen [url]      # Launch isolated Zen Browser
+cloud-dl browse firefox [url]  # Launch isolated Firefox
+cloud-dl browse status         # Check active SOCKS5/HTTP proxy ports
+cloud-dl browse env            # Print PowerShell ($env:) or Bash (export) proxy variables
+cloud-dl browse stop           # Close tracked SOCKS5 SSH tunnel
 ```
 
-### 4. Enable Proxy for Terminal Sessions
+On Windows PowerShell:
+```powershell
+cloud-dl browse env | Invoke-Expression
+```
+On Bash / Zsh:
 ```bash
-# Route curl, git, pip, and pacman through OCI in your current shell:
-eval "$(oci-browse env)"
+eval "$(cloud-dl browse env)"
 ```
 
 ---

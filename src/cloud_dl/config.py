@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -15,14 +16,46 @@ from typing import Any
 from .exceptions import ConfigError
 
 
+def get_config_dir() -> Path:
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "cloud-dl"
+    return Path.home() / ".config" / "cloud-dl"
+
+
+def get_cache_dir() -> Path:
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            return Path(local_appdata) / "cloud-dl"
+    return Path.home() / ".cache" / "cloud-dl"
+
+
 def get_config_path() -> str:
-    return os.path.expanduser(os.environ.get("CLOUD_DL_CONFIG", "~/.config/cloud-dl/config.json"))
+    env_override = os.environ.get("CLOUD_DL_CONFIG")
+    if env_override:
+        return os.path.expanduser(env_override)
+    return str(get_config_dir() / "config.json")
+
+
+def _default_local_download_dir() -> tuple[str, str]:
+    downloads = str(Path.home() / "Downloads")
+    if sys.platform == "win32":
+        return downloads, downloads
+    preferred = "/mnt/DATA"
+    default_local = preferred if os.path.ismount(preferred) else downloads
+    return preferred, default_local
 
 
 def build_default_config() -> dict[str, Any]:
     """Build baseline default configuration without import-time filesystem checks."""
-    preferred_dir = "/mnt/DATA"
-    default_local = preferred_dir if os.path.ismount(preferred_dir) else os.path.expanduser("~/Downloads")
+    preferred_dir, default_local = _default_local_download_dir()
+    ariang_default = str(
+        (Path(os.environ.get("LOCALAPPDATA", "")) / "cloud-dl" / "index.html")
+        if (sys.platform == "win32" and os.environ.get("LOCALAPPDATA"))
+        else (Path.home() / ".local" / "share" / "cloud-dl" / "index.html")
+    )
     return {
         "aws": {
             "name": "AWS Sydney",
@@ -49,15 +82,11 @@ def build_default_config() -> dict[str, Any]:
         "default_local_dir": default_local,
         "watchdog_threshold_s": 1800,
         "proxy": {"socks_port": 1080, "http_port": 8888},
-        "ariang_path": os.path.expanduser("~/.local/share/cloud-dl/index.html"),
+        "ariang_path": ariang_default,
     }
 
 
 class Terminal:
-    @staticmethod
-    def _tty() -> bool:
-        return sys.stdout.isatty()
-
     IS_TTY = sys.stdout.isatty()
     BOLD = "\033[1m" if IS_TTY else ""
     DIM = "\033[2m" if IS_TTY else ""
@@ -123,14 +152,16 @@ def format_time(seconds: Any) -> str:
 
 
 def send_notification(title: str, message: str) -> None:
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
-        subprocess.run(
-            ["notify-send", "-a", "cloud-dl", title, message],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-        )
+    notify_bin = shutil.which("notify-send")
+    if notify_bin:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                [notify_bin, "-a", "cloud-dl", title, message],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -202,7 +233,7 @@ def _prompt_init_values(current: dict[str, Any], cfg_path: Path) -> None:
 
 
 def cmd_init(args: argparse.Namespace) -> None:
-    """Create or update ~/.config/cloud-dl/config.json with randomized RPC credentials."""
+    """Create or update user config.json with randomized RPC credentials."""
     cfg_path = Path(get_config_path())
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     current = deep_merge(build_default_config(), get_cfg())
@@ -228,9 +259,11 @@ def cmd_init(args: argparse.Namespace) -> None:
         rotated = True
 
     cfg_path.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
-    os.chmod(cfg_path, 0o600)
+    if os.name != "nt":
+        os.chmod(cfg_path, 0o600)
     reload_config(str(cfg_path))
-    log_ok(f"Saved configuration to {cfg_path} (permissions 0600).")
+    perm_msg = "permissions 0600" if os.name != "nt" else "user profile scope"
+    log_ok(f"Saved configuration to {cfg_path} ({perm_msg}).")
     if rotated:
         log_info("Generated a new 32-char RPC secret in config.json.")
         log_info("Sync the updated `rpc-secret` in ~/.aria2/aria2.conf on both VPS nodes and restart aria2c.")

@@ -7,4 +7,4 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     VERSION = version("cloud-dl")
 except PackageNotFoundError:
-    VERSION = "2.4.0"
+    VERSION = "2.5.0"

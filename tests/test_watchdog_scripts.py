@@ -5,8 +5,13 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="Watchdog bash script targets Linux VPS")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WATCHDOG_SCRIPT = REPO_ROOT / "scripts" / "auto-shutdown.sh"

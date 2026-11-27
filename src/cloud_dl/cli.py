@@ -55,9 +55,9 @@ def print_custom_help() -> None:
   {b}stop{r}      Stop a cloud instance to pause compute billing ($0.00/hr)
   {b}watchdog{r}  Inspect remote auto-shutdown timer and active connections
   {b}limit{r}     Inspect or adjust global download/upload bandwidth throttles
-  {b}browse{r}    Launch uncensored browser routed via OCI VPS proxy
-  {b}init{r}      Generate or rotate ~/.config/cloud-dl/config.json
-  {b}doctor{r}    Verify config, AWS auth, mounts, proxy, and Aria2 RPC health
+  {b}browse{r}    Launch isolated browser routed via OCI SOCKS5 proxy
+  {b}init{r}      Generate or rotate user config (~/.config/cloud-dl or %APPDATA%\\cloud-dl)
+  {b}doctor{r}    Verify config, SSH/AWS tools, storage, proxy, and Aria2 RPC health
 
 {b}GLOBAL OPTIONS:{r}
   -h, --help         Show this manual and exit
@@ -119,8 +119,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sync = subparsers.add_parser("sync", help="Sync files to local storage", add_help=True)
     p_sync.add_argument("item", nargs="?", help="Specific folder or file name to sync")
-    p_sync.add_argument("--dest", "-d", help="Local target path (defaults to /mnt/DATA or ~/Downloads)")
+    p_sync.add_argument("--dest", "-d", help="Local target path (defaults to /mnt/DATA on Linux or ~/Downloads)")
     p_sync.add_argument("--cloud", "-c", choices=["aws", "oci"], help="Target cloud provider")
+    p_sync.add_argument(
+        "--backend",
+        choices=["auto", "rsync", "ssh"],
+        default="auto",
+        help="Transfer engine: auto (rsync on Linux, native ssh stream on Windows), rsync, or ssh",
+    )
     p_sync.add_argument(
         "--retries", "-r", type=int, default=5, help="Auto-retry count on transient network drops (default: 5)"
     )
@@ -158,8 +164,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-auto-login", action="store_true", help="Disable automatic 'aws login' prompt on expired session"
     )
 
-    p_browse = subparsers.add_parser("browse", help="Launch uncensored browser", add_help=True)
-    p_browse.add_argument("browser", nargs="?", choices=["chrome", "zen", "status", "env"], default="chrome")
+    p_browse = subparsers.add_parser("browse", help="Launch proxied browser via OCI SOCKS5 tunnel", add_help=True)
+    p_browse.add_argument(
+        "browser",
+        nargs="?",
+        choices=["chrome", "edge", "zen", "firefox", "status", "env", "stop"],
+        default="chrome",
+    )
     p_browse.add_argument("target", nargs="?", help="Optional URL to open")
 
     p_ui = subparsers.add_parser("ui", help="Launch AriaNg web dashboard", add_help=True)

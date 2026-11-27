@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cloud-dl"
-version = "2.4.0"
+version = "2.5.0"
 description = "Personal multi-cloud download, torrent, and resilient sync CLI for AWS and OCI."
 readme = "README.md"
 license = "MIT"
@@ -17,7 +17,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: End Users/Desktop",
     "Intended Audience :: System Administrators",
-    "Operating System :: POSIX :: Linux",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

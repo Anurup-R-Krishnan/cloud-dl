@@ -1,4 +1,4 @@
-"""SSH transport with ControlMaster multiplexing, disk parsing, and config IP updates."""
+"""Cross-platform SSH transport with POSIX ControlMaster multiplexing."""
 
 from __future__ import annotations
 
@@ -6,12 +6,11 @@ import contextlib
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
-from .config import format_size, get_cfg
-
-CONTROL_DIR = Path(os.path.expanduser("~/.cache/cloud-dl/ssh"))
+from .config import format_size, get_cache_dir, get_cfg
 
 
 def is_aws_auth_error(stderr: str) -> bool:
@@ -19,15 +18,21 @@ def is_aws_auth_error(stderr: str) -> bool:
     return "session has expired" in err_lower or "aws login" in err_lower or "expiredtoken" in err_lower
 
 
+def get_control_dir() -> Path:
+    return get_cache_dir() / "ssh"
+
+
 def get_control_path() -> str:
-    CONTROL_DIR.mkdir(parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        os.chmod(CONTROL_DIR, 0o700)
-    return str(CONTROL_DIR / "%r@%h:%p")
+    ctrl_dir = get_control_dir()
+    ctrl_dir.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        with contextlib.suppress(OSError):
+            os.chmod(ctrl_dir, 0o700)
+    return str(ctrl_dir / "%r@%h:%p")
 
 
 def build_ssh_base_args() -> list[str]:
-    return [
+    args = [
         "ssh",
         "-o",
         "ConnectTimeout=5",
@@ -35,16 +40,24 @@ def build_ssh_base_args() -> list[str]:
         "BatchMode=yes",
         "-o",
         "LogLevel=ERROR",
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-        f"ControlPath={get_control_path()}",
-        "-o",
-        "ControlPersist=300",
     ]
+    if sys.platform != "win32":
+        args.extend(
+            [
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                f"ControlPath={get_control_path()}",
+                "-o",
+                "ControlPersist=300",
+            ]
+        )
+    return args
 
 
 def close_ssh_control_socket(host: str) -> None:
+    if sys.platform == "win32":
+        return
     cmd = [
         "ssh",
         "-o",
@@ -59,12 +72,11 @@ def close_ssh_control_socket(host: str) -> None:
 
 def update_ssh_config_ip(host_alias: str, new_ip: str, ssh_config_path: str | None = None) -> bool:
     """Update HostName only within the matching Host block of ~/.ssh/config."""
-    ssh_config = ssh_config_path or os.path.expanduser("~/.ssh/config")
-    if not os.path.isfile(ssh_config):
+    ssh_config = Path(ssh_config_path) if ssh_config_path else (Path.home() / ".ssh" / "config")
+    if not ssh_config.is_file():
         return False
     try:
-        with open(ssh_config, encoding="utf-8") as fh:
-            lines = fh.readlines()
+        lines = ssh_config.read_text(encoding="utf-8").splitlines(keepends=True)
 
         in_target_block = False
         updated = False
@@ -92,8 +104,7 @@ def update_ssh_config_ip(host_alias: str, new_ip: str, ssh_config_path: str | No
             out_lines.append(line)
 
         if updated:
-            with open(ssh_config, "w", encoding="utf-8") as fh:
-                fh.writelines(out_lines)
+            ssh_config.write_text("".join(out_lines), encoding="utf-8")
         return updated
     except OSError:
         return False
