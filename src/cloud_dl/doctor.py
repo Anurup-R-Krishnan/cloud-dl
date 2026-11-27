@@ -293,6 +293,20 @@ def _write_firefox_socks_prefs(profile_dir: Path, socks_port: int) -> None:
     (profile_dir / "user.js").write_text(prefs, encoding="utf-8")
 
 
+def _probe_socks_egress_ip(socks_port: int) -> str:
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        return ""
+    res = subprocess.run(
+        [curl_bin, "-s", "-m", "3", "--socks5-hostname", f"127.0.0.1:{socks_port}", "https://icanhazip.com"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
 def _print_browse_status(socks_port: int, http_port: int) -> None:
     socks_up = _is_local_port_open(socks_port)
     http_up = _is_local_port_open(http_port)
@@ -300,7 +314,9 @@ def _print_browse_status(socks_port: int, http_port: int) -> None:
     pid = tracked.get("pid") if tracked else None
     pid_note = f" (PID {pid})" if isinstance(pid, int) and is_pid_alive(pid) else ""
     if socks_up:
-        log_ok(f"SOCKS5 proxy active on 127.0.0.1:{socks_port}{pid_note}.")
+        egress = _probe_socks_egress_ip(socks_port)
+        egress_note = f", egress {egress}" if egress else ""
+        log_ok(f"SOCKS5 proxy active on 127.0.0.1:{socks_port}{pid_note}{egress_note}.")
     else:
         log_warn(f"SOCKS5 proxy is inactive on 127.0.0.1:{socks_port}. Run 'cloud-dl browse' to start it.")
     if http_up:

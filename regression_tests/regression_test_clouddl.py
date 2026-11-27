@@ -14,10 +14,9 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cloud_dl.aws import is_aws_auth_error  # noqa: E402
-from cloud_dl.config import deep_merge  # noqa: E402
+from cloud_dl.config import deep_merge, get_cfg  # noqa: E402
 from cloud_dl.cost import format_usd  # noqa: E402
-from cloud_dl.ssh import parse_df_bytes_line, update_ssh_config_ip  # noqa: E402
+from cloud_dl.ssh import is_aws_auth_error, parse_df_bytes_line, update_ssh_config_ip  # noqa: E402
 
 passed = 0
 failed = 0
@@ -45,7 +44,7 @@ else:
     record_result("cloud-dl CLI Executable in PATH", False, "Missing or not executable")
 
 # 2. Check AriaNg Web UI bundle installed
-ui_path = os.path.expanduser("~/.local/share/cloud-dl/index.html")
+ui_path = os.path.expanduser(str(get_cfg().get("ariang_path", "~/.local/share/cloud-dl/index.html")))
 if os.path.isfile(ui_path) and os.path.getsize(ui_path) > 1000000:
     record_result("AriaNg AllInOne HTML Bundle", True, f"Present ({os.path.getsize(ui_path) / (1024 * 1024):.1f} MB)")
 else:

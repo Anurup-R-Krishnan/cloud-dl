@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cloud-dl"
-version = "2.5.1"
+version = "2.6.0"
 description = "Personal multi-cloud download, torrent, and resilient sync CLI for AWS and OCI."
 readme = "README.md"
 license = "MIT"
@@ -28,7 +28,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.8", "build>=1.2", "twine>=5.0"]
+dev = ["pytest>=8.0", "ruff>=0.8", "mypy>=1.13", "build>=1.2", "twine>=5.0"]
 
 [project.urls]
 Homepage = "https://github.com/Anurup-R-Krishnan/cloud-dl"
@@ -60,3 +60,8 @@ max-complexity = 10
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true

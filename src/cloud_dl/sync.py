@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -17,6 +18,7 @@ import tarfile
 import threading
 import time
 import zlib
+from collections.abc import Iterator
 from pathlib import Path
 from typing import IO
 
@@ -26,6 +28,7 @@ from .config import (
     format_size,
     format_speed,
     format_time,
+    get_cache_dir,
     get_cfg,
     log_err,
     log_info,
@@ -41,9 +44,26 @@ TRANSIENT_RSYNC_CODES = {12, 30, 35, 255}
 RSYNC_SSH_CMD = "ssh -c aes128-gcm@openssh.com -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -o TCPKeepAlive=yes"
 SSH_STREAM_CHUNK_BYTES = 262_144
 SMALL_FILE_THRESHOLD_BYTES = 5 * 1024 * 1024
+TAIL_CHECK_BYTES = 1_048_576
 TAR_BATCH_MAX_FILES = 200
 TAR_BATCH_MAX_BYTES = 64 * 1024 * 1024
 _WIN_ILLEGAL_CHARS = re.compile(r'[:*?"<>|]')
+_WIN_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:[\\/]")
+
+_REMOTE_TAIL_SHA_SCRIPT = (
+    "import hashlib,sys\n"
+    "p,start,length=sys.argv[1],int(sys.argv[2]),int(sys.argv[3])\n"
+    "h=hashlib.sha256()\n"
+    "with open(p,'rb') as f:\n"
+    "    f.seek(start)\n"
+    "    rem=length\n"
+    "    while rem>0:\n"
+    "        c=f.read(min(262144,rem))\n"
+    "        if not c: break\n"
+    "        h.update(c)\n"
+    "        rem-=len(c)\n"
+    "print(h.hexdigest())\n"
+)
 
 _REMOTE_LIST_SCRIPT = (
     "import json,os,sys\n"
@@ -436,20 +456,110 @@ def _copy_stream_to_file(
     return written
 
 
+def _as_os_path(path: Path) -> str:
+    """Return extended-length Windows path (`\\\\?\\`) when approaching MAX_PATH."""
+    raw = str(path)
+    if sys.platform == "win32" and not raw.startswith("\\\\?\\") and len(raw) >= 240:
+        resolved = raw if _WIN_DRIVE_PREFIX.match(raw) else str(path.resolve())
+        if resolved.startswith("\\\\"):
+            return "\\\\?\\UNC\\" + resolved[2:]
+        return "\\\\?\\" + resolved
+    return raw
+
+
+def _lock_file_nonblocking(fd: int) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file(fd: int) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        with contextlib.suppress(OSError):
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _sync_lock_guard(lock_path: Path | None = None) -> Iterator[Path]:
+    target = lock_path or (get_cache_dir() / "sync.lock")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "a+", encoding="utf-8") as fh:
+        try:
+            _lock_file_nonblocking(fh.fileno())
+        except OSError as exc:
+            raise SyncError("Another 'cloud-dl sync' process is already active.") from exc
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"{os.getpid()}\n")
+            fh.flush()
+            yield target
+        finally:
+            _unlock_file(fh.fileno())
+    with contextlib.suppress(OSError):
+        target.unlink()
+
+
+def _verify_local_tail_matches_remote(host: str, remote_fp: str, local_path: Path, offset: int) -> bool:
+    check_len = min(TAIL_CHECK_BYTES, offset)
+    start = offset - check_len
+    digest = hashlib.sha256()
+    with open(_as_os_path(local_path), "rb") as fh:
+        fh.seek(start)
+        remaining = check_len
+        while remaining > 0:
+            chunk = fh.read(min(SSH_STREAM_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+    local_hex = digest.hexdigest().lower()
+
+    cmd = f"python3 -c {shlex.quote(_REMOTE_TAIL_SHA_SCRIPT)} {shlex.quote(remote_fp)} {start} {check_len}"
+    code, stdout, stderr = run_ssh(host, cmd, timeout=25)
+    if code != 0:
+        raise _TransientStreamError(f"Failed tail checksum check for '{remote_fp}' (exit {code}: {stderr.strip()})")
+    return stdout.strip().lower() == local_hex
+
+
+def _resolve_resume_offset(host: str, remote_fp: str, local_path: Path, local_size: int, remote_size: int) -> int:
+    if not (0 < local_size < remote_size):
+        return 0
+    if _verify_local_tail_matches_remote(host, remote_fp, local_path, local_size):
+        return local_size
+    log_warn(f"Trailing bytes of '{local_path.name}' diverged from remote source; restarting file cleanly.")
+    return 0
+
+
 def _stream_single_file_ssh(host: str, remote_fp: str, local_path: Path, remote_size: int, rel_label: str) -> None:
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    local_size = local_path.stat().st_size if local_path.is_file() else 0
+    os.makedirs(_as_os_path(local_path.parent), exist_ok=True)
+    os_local = _as_os_path(local_path)
+    local_size = os.path.getsize(os_local) if os.path.isfile(os_local) else 0
     if local_size == remote_size:
         log_ok(f"Already synced: {rel_label} ({format_size(remote_size)})")
         return
 
-    offset = local_size if 0 < local_size < remote_size else 0
-    mode = "ab" if offset > 0 else "wb"
     if remote_size == 0:
-        local_path.touch()
+        open(os_local, "wb").close()
         log_ok(f"Created empty file: {rel_label}")
         return
 
+    offset = _resolve_resume_offset(host, remote_fp, local_path, local_size, remote_size)
+    mode = "ab" if offset > 0 else "wb"
     action = "Resuming" if offset > 0 else "Downloading"
     log_info(f"{action} {rel_label} from byte {format_size(offset)} / {format_size(remote_size)}...")
     remote_cmd = f"python3 -c {shlex.quote(_REMOTE_READ_SCRIPT)} {shlex.quote(remote_fp)} {offset}"
@@ -457,11 +567,11 @@ def _stream_single_file_ssh(host: str, remote_fp: str, local_path: Path, remote_
     proc = subprocess.Popen(ssh_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.stdout is None or proc.stderr is None:
         raise SyncError("Failed to attach stdout/stderr pipes to SSH stream process.")
-    with open(local_path, mode) as fh:
+    with open(os_local, mode) as fh:
         _copy_stream_to_file(proc.stdout, fh, rel_label, offset, remote_size)
     err_out = proc.stderr.read().decode("utf-8", errors="replace").strip()
     rc = proc.wait()
-    final_size = local_path.stat().st_size if local_path.is_file() else 0
+    final_size = os.path.getsize(os_local) if os.path.isfile(os_local) else 0
     if rc != 0 or final_size != remote_size:
         raise _TransientStreamError(
             f"Stream interrupted for '{rel_label}' ({final_size}/{remote_size} bytes, exit {rc}: {err_out})"
@@ -488,7 +598,7 @@ def _extract_tar_member(tf: tarfile.TarFile, member: tarfile.TarInfo, resolved_r
     src_fh = tf.extractfile(member)
     if src_fh is None:
         return
-    with src_fh, open(local_target, "wb") as out_fh:
+    with src_fh, open(_as_os_path(local_target), "wb") as out_fh:
         shutil.copyfileobj(src_fh, out_fh, SSH_STREAM_CHUNK_BYTES)
 
 
@@ -684,15 +794,16 @@ def cmd_sync(args: argparse.Namespace) -> None:
     log_info(f"Syncing from {cfg[cloud]['name']} to {dest_dir} (backend: {backend}, fs: {fstype or 'unknown'})...")
     sys.stdout.write(f"Source: {host}:{remote_path}\nTarget: {dest_dir}{os.sep}\n")
 
-    if backend == "ssh":
-        _run_ssh_stream_with_retries(host, cloud, cfg["remote_dl_dir"], item, dest_dir, max_attempts)
-    else:
-        is_fat = fstype in {"exfat", "vfat", "msdos", "fat32"}
-        use_append = bool(getattr(args, "append", False))
-        rsync_cmd = build_rsync_command(f"{host}:{remote_path}", dest_dir, is_fat=is_fat, append=use_append)
-        ret_code = _run_rsync_with_retries(rsync_cmd, cloud, host, max_attempts)
-        if ret_code != 0:
-            raise SyncError(f"rsync failed with exit code {ret_code}. Remote files were preserved.")
+    with _sync_lock_guard():
+        if backend == "ssh":
+            _run_ssh_stream_with_retries(host, cloud, cfg["remote_dl_dir"], item, dest_dir, max_attempts)
+        else:
+            is_fat = fstype in {"exfat", "vfat", "msdos", "fat32"}
+            use_append = bool(getattr(args, "append", False))
+            rsync_cmd = build_rsync_command(f"{host}:{remote_path}", dest_dir, is_fat=is_fat, append=use_append)
+            ret_code = _run_rsync_with_retries(rsync_cmd, cloud, host, max_attempts)
+            if ret_code != 0:
+                raise SyncError(f"rsync failed with exit code {ret_code}. Remote files were preserved.")
 
     log_ok("Synchronization completed successfully.")
     if getattr(args, "verify", False):

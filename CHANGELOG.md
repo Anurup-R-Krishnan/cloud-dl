@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.6.0] - 2026-11-27
+
+### Added
+- Trailing 1 MiB SHA-256 tail integrity verification before byte-offset SSH stream resume (`--backend ssh`), automatically restarting cleanly from offset `0` if tail corruption is detected.
+- Advisory `sync.lock` concurrency guard (`fcntl.flock` / `msvcrt.locking`) preventing overlapping `cloud-dl sync` runs on the same machine.
+- Extended-length Windows path (`\\?\`) support in `cloud-dl sync` (`_as_os_path`) for deeply nested archives exceeding `240` characters.
+- External egress IP display in `cloud-dl browse status` and strict `mypy --strict` enforcement in CI alongside Node 24–native GitHub Actions (`@v7`).
+
+### Changed
+- Converted `scripts/oci-browse` into a thin shim forwarding to `cloud-dl browse` cleanly.
+- Updated `regression_tests/regression_test_clouddl.py` to import `is_aws_auth_error` from `cloud_dl.ssh` and resolve `ariang_path` dynamically from user config.
+
 ## [2.5.1] - 2026-11-27
 
 ### Added

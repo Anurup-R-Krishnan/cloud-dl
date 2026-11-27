@@ -454,8 +454,14 @@ def test_ssh_stream_sync_resumes_partial_file_after_transient_drop(tmp_path: Pat
         assert f" {len(b'hello wo')}" in cmd[-1]
         return _FakeProc(b"rld!", 0)
 
+    def fake_run_ssh(_host, command, **_kwargs):
+        if "hashlib" in command:
+            cur_len = partial.stat().st_size
+            return 0, hashlib.sha256(full_payload[:cur_len]).hexdigest(), ""
+        return 0, manifest, ""
+
     with (
-        patch.object(sync, "run_ssh", return_value=(0, manifest, "")),
+        patch.object(sync, "run_ssh", side_effect=fake_run_ssh),
         patch.object(sync.subprocess, "Popen", side_effect=fake_popen),
         patch.object(sync.time, "sleep"),
     ):
@@ -627,3 +633,59 @@ def test_ssh_stream_batches_small_files_via_tar(tmp_path: Path) -> None:
 def test_ssh_base_args_include_accept_new() -> None:
     args_str = " ".join(ssh.build_ssh_base_args())
     assert "StrictHostKeyChecking=accept-new" in args_str
+
+
+def test_ssh_stream_restarts_from_zero_when_tail_sha256_mismatches(tmp_path: Path) -> None:
+    import io
+
+    dest_dir = tmp_path / "out"
+    dest_dir.mkdir()
+    partial = dest_dir / "pkg" / "movie.bin"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"BAD!!!")
+    full_payload = b"hello world!"
+    manifest = json.dumps([{"rel": "pkg/movie.bin", "size": len(full_payload), "remote": "/dl/pkg/movie.bin"}])
+
+    def fake_run_ssh(_host, command, **_kwargs):
+        if "hashlib" in command:
+            return 0, hashlib.sha256(b"hello ").hexdigest(), ""
+        return 0, manifest, ""
+
+    class _FullProc:
+        def __init__(self, data: bytes) -> None:
+            self.stdout = io.BytesIO(data)
+            self.stderr = io.BytesIO(b"")
+
+        def wait(self) -> int:
+            return 0
+
+    seen_cmds: list[str] = []
+
+    def fake_popen(cmd, **_kwargs):
+        seen_cmds.append(cmd[-1])
+        assert cmd[-1].endswith(" 0")
+        return _FullProc(full_payload)
+
+    with (
+        patch.object(sync, "run_ssh", side_effect=fake_run_ssh),
+        patch.object(sync.subprocess, "Popen", side_effect=fake_popen),
+    ):
+        sync._run_ssh_stream_with_retries("oci-vps", "oci", "/dl", "pkg", str(dest_dir), 2)
+
+    assert len(seen_cmds) == 1
+    assert partial.read_bytes() == full_payload
+
+
+def test_windows_long_path_adds_extended_prefix() -> None:
+    deep_win = Path("C:\\" + ("segment\\" * 32) + "file.bin")
+    short_win = Path(r"C:\Downloads\file.bin")
+    with patch.object(sync.sys, "platform", "win32"):
+        assert sync._as_os_path(deep_win).startswith("\\\\?\\")
+        assert sync._as_os_path(short_win) == str(short_win)
+
+
+def test_sync_lock_guard_blocks_concurrent_sync(tmp_path: Path) -> None:
+    lock_file = tmp_path / "sync.lock"
+    with sync._sync_lock_guard(lock_file), pytest.raises(exceptions.SyncError), sync._sync_lock_guard(lock_file):
+        pass
+    assert not lock_file.exists()
