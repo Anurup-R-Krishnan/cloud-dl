@@ -1,0 +1,44 @@
+# --- AI & Planning Artifacts ---
+plans/
+.aider*
+.claude/
+.cursor/
+
+# --- Python Bytecode & Packaging ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.installed.cfg
+
+# --- Virtual Environments & Caches ---
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Secrets & Local Config ---
+.env
+.env.*
+!.env.example
+config.local.json
+
+# --- Editors & OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+*.session

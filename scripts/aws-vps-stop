@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+echo "[DEPRECATED] Use 'cloud-dl stop --cloud aws' directly." >&2
+exec cloud-dl stop --cloud aws "$@"

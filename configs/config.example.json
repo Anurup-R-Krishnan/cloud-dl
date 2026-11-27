@@ -1,0 +1,30 @@
+{
+  "aws": {
+    "name": "AWS Sydney",
+    "host": "aws-vps",
+    "instance_id": "i-00000000000000000",
+    "region": "ap-southeast-2",
+    "specs": "t4g.small (2 vCPU, 2GB RAM, up to 5 Gbps burst)",
+    "disk_size_gb": 80,
+    "compute_per_hr": 0.0211,
+    "storage_per_gb_mo": 0.088,
+    "credit_balance_usd": 180.0
+  },
+  "oci": {
+    "name": "OCI Hyderabad",
+    "host": "oci-vps",
+    "region": "ap-hyderabad-1",
+    "specs": "VM.Standard.E2.1.Micro (Always Free, 10 TB egress)",
+    "disk_size_gb": 45
+  },
+  "rpc_secret": "REPLACE_WITH_32_HEX_SECRET_FROM_CLOUD_DL_INIT",
+  "rpc_port": 6800,
+  "remote_dl_dir": "/home/ubuntu/downloads",
+  "preferred_local_dir": "/mnt/DATA",
+  "watchdog_threshold_s": 1800,
+  "proxy": {
+    "socks_port": 1080,
+    "http_port": 8888
+  },
+  "ariang_path": "~/.local/share/cloud-dl/index.html"
+}

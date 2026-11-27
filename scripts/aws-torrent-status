@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+echo "[DEPRECATED] Use 'cloud-dl status --cloud aws' directly." >&2
+exec cloud-dl status --cloud aws "$@"

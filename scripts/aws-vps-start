@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+echo "[DEPRECATED] Use 'cloud-dl start --cloud aws' directly." >&2
+exec cloud-dl start --cloud aws "$@"

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Wrapper delegating to cloud-dl sync with auto-login, EC2 start, exFAT fast append-resume, MD5 verify, and auto-stop.
+set -euo pipefail
+
+exec cloud-dl sync --cloud aws --append --verify --stop-after "$@"

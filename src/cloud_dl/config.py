@@ -1,0 +1,236 @@
+"""Configuration management, terminal styling, formatters, and `init` wizard."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import secrets
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from .exceptions import ConfigError
+
+
+def get_config_path() -> str:
+    return os.path.expanduser(os.environ.get("CLOUD_DL_CONFIG", "~/.config/cloud-dl/config.json"))
+
+
+def build_default_config() -> dict[str, Any]:
+    """Build baseline default configuration without import-time filesystem checks."""
+    preferred_dir = "/mnt/DATA"
+    default_local = preferred_dir if os.path.ismount(preferred_dir) else os.path.expanduser("~/Downloads")
+    return {
+        "aws": {
+            "name": "AWS Sydney",
+            "host": "aws-vps",
+            "instance_id": "",
+            "region": "ap-southeast-2",
+            "specs": "t4g.small (2 vCPU, 2GB RAM, up to 5 Gbps burst)",
+            "disk_size_gb": 80,
+            "compute_per_hr": 0.0211,
+            "storage_per_gb_mo": 0.088,
+            "credit_balance_usd": 180.0,
+        },
+        "oci": {
+            "name": "OCI Hyderabad",
+            "host": "oci-vps",
+            "region": "ap-hyderabad-1",
+            "specs": "VM.Standard.E2.1.Micro (Always Free, 10 TB egress)",
+            "disk_size_gb": 45,
+        },
+        "rpc_secret": "",
+        "rpc_port": 6800,
+        "remote_dl_dir": "/home/ubuntu/downloads",
+        "preferred_local_dir": preferred_dir,
+        "default_local_dir": default_local,
+        "watchdog_threshold_s": 1800,
+        "proxy": {"socks_port": 1080, "http_port": 8888},
+        "ariang_path": os.path.expanduser("~/.local/share/cloud-dl/index.html"),
+    }
+
+
+class Terminal:
+    @staticmethod
+    def _tty() -> bool:
+        return sys.stdout.isatty()
+
+    IS_TTY = sys.stdout.isatty()
+    BOLD = "\033[1m" if IS_TTY else ""
+    DIM = "\033[2m" if IS_TTY else ""
+    UNDERLINE = "\033[4m" if IS_TTY else ""
+    RED = "\033[31m" if IS_TTY else ""
+    GREEN = "\033[32m" if IS_TTY else ""
+    YELLOW = "\033[33m" if IS_TTY else ""
+    BLUE = "\033[34m" if IS_TTY else ""
+    CYAN = "\033[36m" if IS_TTY else ""
+    RESET = "\033[0m" if IS_TTY else ""
+    CLEAR_SCREEN = "\033[2J\033[H" if IS_TTY else ""
+
+
+def log_info(msg: str) -> None:
+    sys.stderr.write(f"{Terminal.CYAN}[INFO]{Terminal.RESET} {msg}\n")
+
+
+def log_ok(msg: str) -> None:
+    sys.stderr.write(f"{Terminal.GREEN}[OK]{Terminal.RESET} {msg}\n")
+
+
+def log_warn(msg: str) -> None:
+    sys.stderr.write(f"{Terminal.YELLOW}[WARN]{Terminal.RESET} {msg}\n")
+
+
+def log_err(msg: str) -> None:
+    sys.stderr.write(f"{Terminal.RED}[ERROR]{Terminal.RESET} {msg}\n")
+
+
+def format_size(bytes_val: Any) -> str:
+    try:
+        val = float(bytes_val)
+    except (ValueError, TypeError):
+        return "0 B"
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if val < 1024.0:
+            return f"{val:.1f} {unit}"
+        val /= 1024.0
+    return f"{val:.1f} PB"
+
+
+def format_speed(bps: Any) -> str:
+    return f"{format_size(bps)}/s"
+
+
+def format_time(seconds: Any) -> str:
+    try:
+        s = int(seconds)
+    except (ValueError, TypeError):
+        return "N/A"
+    if s < 0 or s > 86400 * 30:
+        return "N/A"
+    m, sec = divmod(s, 60)
+    h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    if d > 0:
+        return f"{d}d {h}h {m}m"
+    if h > 0:
+        return f"{h}h {m}m {sec}s"
+    if m > 0:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
+
+
+def send_notification(title: str, message: str) -> None:
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(
+            ["notify-send", "-a", "cloud-dl", title, message],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge override dictionary into a copy of base."""
+    result: dict[str, Any] = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_config(config_path: str | None = None) -> dict[str, Any]:
+    defaults = build_default_config()
+    path = config_path or get_config_path()
+    merged = deep_merge(defaults, {})
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+            if not isinstance(cfg, dict):
+                log_warn(f"Ignoring non-object config in {path}")
+            else:
+                merged = deep_merge(defaults, cfg)
+        except (OSError, json.JSONDecodeError) as exc:
+            log_warn(f"Failed to load {path}: {exc}")
+
+    env_secret = os.environ.get("CLOUD_DL_RPC_SECRET")
+    if env_secret:
+        merged["rpc_secret"] = env_secret
+    return merged
+
+
+CFG: dict[str, Any] = {}
+
+
+def get_cfg() -> dict[str, Any]:
+    """Return active configuration, loading lazily on first access."""
+    if not CFG:
+        CFG.update(load_config())
+    return CFG
+
+
+def reload_config(config_path: str | None = None) -> dict[str, Any]:
+    fresh = load_config(config_path=config_path)
+    CFG.clear()
+    CFG.update(fresh)
+    return CFG
+
+
+def _prompt_with_default(label: str, current_val: Any) -> str:
+    raw = input(f"{label} [{current_val}]: ").strip()
+    return raw if raw else str(current_val)
+
+
+def _prompt_init_values(current: dict[str, Any], cfg_path: Path) -> None:
+    sys.stdout.write(f"\n{Terminal.BOLD}cloud-dl Configuration Setup ({cfg_path}){Terminal.RESET}\n")
+    sys.stdout.write("-" * 60 + "\n")
+    current["aws"]["instance_id"] = _prompt_with_default("AWS EC2 Instance ID", current["aws"]["instance_id"])
+    current["aws"]["region"] = _prompt_with_default("AWS Region", current["aws"]["region"])
+    current["preferred_local_dir"] = _prompt_with_default("Preferred local sync drive", current["preferred_local_dir"])
+    current["aws"]["compute_per_hr"] = float(
+        _prompt_with_default("EC2 compute USD/hour", current["aws"]["compute_per_hr"])
+    )
+    current["aws"]["credit_balance_usd"] = float(
+        _prompt_with_default("Credit balance USD", current["aws"]["credit_balance_usd"])
+    )
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    """Create or update ~/.config/cloud-dl/config.json with randomized RPC credentials."""
+    cfg_path = Path(get_config_path())
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    current = deep_merge(build_default_config(), get_cfg())
+
+    if getattr(args, "instance_id", None):
+        current["aws"]["instance_id"] = args.instance_id.strip()
+    if getattr(args, "region", None):
+        current["aws"]["region"] = args.region.strip()
+    if getattr(args, "local_dir", None):
+        current["preferred_local_dir"] = args.local_dir.strip()
+
+    if not getattr(args, "non_interactive", False):
+        try:
+            _prompt_init_values(current, cfg_path)
+        except (KeyboardInterrupt, EOFError) as exc:
+            raise ConfigError("Initialization canceled.") from exc
+        except ValueError as exc:
+            raise ConfigError(f"Invalid numeric value provided: {exc}") from exc
+
+    rotated = False
+    if not getattr(args, "keep_secret", False) or not current.get("rpc_secret"):
+        current["rpc_secret"] = secrets.token_hex(16)
+        rotated = True
+
+    cfg_path.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+    os.chmod(cfg_path, 0o600)
+    reload_config(str(cfg_path))
+    log_ok(f"Saved configuration to {cfg_path} (permissions 0600).")
+    if rotated:
+        log_info("Generated a new 32-char RPC secret in config.json.")
+        log_info("Sync the updated `rpc-secret` in ~/.aria2/aria2.conf on both VPS nodes and restart aria2c.")

@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# oci-browse: Secure, uncensored general browsing routed through OCI VPS proxy.
+set -euo pipefail
+
+CONFIG_FILE="${CLOUD_DL_CONFIG:-$HOME/.config/cloud-dl/config.json}"
+
+read_cfg_val() {
+    local expr="$1"
+    local default_val="$2"
+    if [ -f "$CONFIG_FILE" ] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$CONFIG_FILE" "$expr" "$default_val" << 'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+    cur = data
+    for key in sys.argv[2].split("."):
+        cur = cur.get(key) if isinstance(cur, dict) else None
+    print(sys.argv[3] if cur in (None, "") else cur)
+except (OSError, json.JSONDecodeError):
+    print(sys.argv[3])
+PYEOF
+    else
+        echo "$default_val"
+    fi
+}
+
+OCI_HOST=$(read_cfg_val "oci.host" "oci-vps")
+SOCKS_PORT=$(read_cfg_val "proxy.socks_port" "1080")
+HTTP_PORT=$(read_cfg_val "proxy.http_port" "8888")
+OCI_IP=$(ssh -G "$OCI_HOST" 2>/dev/null | awk '/^hostname / {print $2; exit}' || true)
+CHROME_PROFILE="$HOME/.config/google-chrome-oci"
+ZEN_PROFILE="$HOME/.zen/oci-profile"
+
+ensure_tunnel() {
+    if ! systemctl --user is-active --quiet oci-socks5.service; then
+        echo "[INFO] Starting OCI proxy tunnel service..."
+        systemctl --user start oci-socks5.service
+        for _ in $(seq 1 10); do
+            if ss -tln | grep -q ":${SOCKS_PORT} "; then
+                return 0
+            fi
+            sleep 0.5
+        done
+    fi
+}
+
+check_status() {
+    ensure_tunnel
+    echo "================================================================="
+    echo " OCI VPS General Browsing & Proxy Status (${OCI_HOST})"
+    echo "================================================================="
+    systemctl --user status oci-socks5.service --no-pager | grep -E "Active:|Loaded:" || true
+    echo "-----------------------------------------------------------------"
+    echo -n "  SOCKS5 Tunnel (127.0.0.1:$SOCKS_PORT): "
+    IP_SOCKS=$(curl -s --socks5-hostname "127.0.0.1:$SOCKS_PORT" https://icanhazip.com -m 5 2>/dev/null || true)
+    if [ -n "$OCI_IP" ] && [ "$IP_SOCKS" = "$OCI_IP" ]; then
+        echo -e "\033[92mONLINE (Egress: $IP_SOCKS - Oracle Cloud)\033[0m"
+    elif [ -n "$IP_SOCKS" ]; then
+        echo -e "\033[92mONLINE (Egress: $IP_SOCKS)\033[0m"
+    else
+        echo -e "\033[91mOFFLINE\033[0m"
+    fi
+
+    echo -n "  HTTP/HTTPS Proxy (127.0.0.1:$HTTP_PORT): "
+    IP_HTTP=$(curl -s -x "http://127.0.0.1:$HTTP_PORT" https://icanhazip.com -m 5 2>/dev/null || true)
+    if [ -n "$OCI_IP" ] && [ "$IP_HTTP" = "$OCI_IP" ]; then
+        echo -e "\033[92mONLINE (Egress: $IP_HTTP - Oracle Cloud)\033[0m"
+    elif [ -n "$IP_HTTP" ]; then
+        echo -e "\033[92mONLINE (Egress: $IP_HTTP)\033[0m"
+    else
+        echo -e "\033[91mOFFLINE\033[0m"
+    fi
+    echo "================================================================="
+}
+
+launch_chrome() {
+    if ! command -v google-chrome >/dev/null 2>&1; then
+        echo "[ERROR] google-chrome not found in PATH." >&2
+        exit 1
+    fi
+    ensure_tunnel
+    URL="${1:-https://google.com}"
+    mkdir -p "$CHROME_PROFILE"
+    echo "[INFO] Launching Google Chrome via ${OCI_HOST} (${OCI_IP:-proxy})..."
+    echo "       Profile: $CHROME_PROFILE"
+    nohup google-chrome \
+        --proxy-server="http://127.0.0.1:$HTTP_PORT" \
+        --user-data-dir="$CHROME_PROFILE" \
+        --no-first-run \
+        --password-store=basic \
+        "$URL" >/dev/null 2>&1 &
+    disown
+}
+
+launch_zen() {
+    if ! command -v zen-browser >/dev/null 2>&1; then
+        echo "[ERROR] zen-browser not found in PATH." >&2
+        exit 1
+    fi
+    ensure_tunnel
+    URL="${1:-https://google.com}"
+    mkdir -p "$ZEN_PROFILE"
+    echo "[INFO] Launching Zen Browser via ${OCI_HOST} (${OCI_IP:-proxy})..."
+    env all_proxy="socks5h://127.0.0.1:$SOCKS_PORT" \
+        http_proxy="http://127.0.0.1:$HTTP_PORT" \
+        https_proxy="http://127.0.0.1:$HTTP_PORT" \
+        ALL_PROXY="socks5h://127.0.0.1:$SOCKS_PORT" \
+        HTTP_PROXY="http://127.0.0.1:$HTTP_PORT" \
+        HTTPS_PROXY="http://127.0.0.1:$HTTP_PORT" \
+        nohup zen-browser "$URL" >/dev/null 2>&1 &
+    disown
+}
+
+print_env() {
+    cat << EOF
+# Copy and paste or run: eval "\$(oci-browse env)"
+export all_proxy="socks5h://127.0.0.1:$SOCKS_PORT"
+export http_proxy="http://127.0.0.1:$HTTP_PORT"
+export https_proxy="http://127.0.0.1:$HTTP_PORT"
+export ALL_PROXY="socks5h://127.0.0.1:$SOCKS_PORT"
+export HTTP_PROXY="http://127.0.0.1:$HTTP_PORT"
+export HTTPS_PROXY="http://127.0.0.1:$HTTP_PORT"
+echo "[OK] Shell proxy configured. Egress active via ${OCI_HOST} (${OCI_IP:-127.0.0.1})."
+EOF
+}
+
+case "${1:-}" in
+    status)
+        check_status
+        ;;
+    chrome)
+        shift
+        launch_chrome "$@"
+        ;;
+    zen)
+        shift
+        launch_zen "$@"
+        ;;
+    env)
+        print_env
+        ;;
+    help|--help|-h)
+        echo "Usage: oci-browse [chrome|zen|status|env] [URL]"
+        echo "  oci-browse              -> Opens Google Chrome routed through OCI VPS"
+        echo "  oci-browse chrome [url] -> Opens Google Chrome routed through OCI VPS"
+        echo "  oci-browse zen [url]    -> Opens Zen Browser routed through OCI VPS"
+        echo "  oci-browse status       -> Checks proxy tunnel health & egress IP"
+        echo "  oci-browse env          -> Outputs shell export commands for CLI proxying"
+        ;;
+    *)
+        launch_chrome "$@"
+        ;;
+esac

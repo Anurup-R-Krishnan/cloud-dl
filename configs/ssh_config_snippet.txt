@@ -1,0 +1,24 @@
+# ==========================================
+# VPS SSH Configuration Snippet (~/.ssh/config)
+# ==========================================
+
+# 1. Oracle Cloud Always Free VPS (static IP, accept host key on first connect)
+Host oci-vps
+  HostName <OCI_PUBLIC_IP>
+  User ubuntu
+  IdentityFile ~/.ssh/oci_vps
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+  StrictHostKeyChecking accept-new
+
+# 2. AWS EC2 High-Speed Torrent VPS (ephemeral public IP updated automatically by cloud-dl)
+#    Use StrictHostKeyChecking accept-new if using Elastic IP; for ephemeral IPs,
+#    update known_hosts with `ssh-keygen -R <old_ip>` or manage keys cleanly.
+Host aws-vps
+  HostName <AWS_DYNAMIC_IP>
+  User ubuntu
+  IdentityFile ~/.ssh/oci_vps
+  ServerAliveInterval 15
+  ServerAliveCountMax 8
+  Ciphers aes128-gcm@openssh.com,chacha20-poly1305@openssh.com
+  StrictHostKeyChecking accept-new
