@@ -441,30 +441,33 @@ def cmd_watchdog(args: argparse.Namespace) -> None:
         log_err(f"Watchdog probe failed: {stderr.strip()}")
 
 
-def _check_config_health(cfg: dict[str, Any]) -> int:
-    issues = 0
-    cfg_path = Path(get_config_path())
-    if cfg_path.is_file():
-        if os.name == "nt":
-            log_ok(f"Config loaded ({cfg_path}).")
-        else:
-            mode = cfg_path.stat().st_mode & 0o777
-            if mode & 0o077:
-                log_warn(f"Config permissions are too open ({oct(mode)}); run 'chmod 600 {cfg_path}'.")
-                issues += 1
-            else:
-                log_ok(f"Config loaded ({cfg_path}, mode {oct(mode)}).")
-    else:
+def _check_config_file_perms(cfg_path: Path) -> int:
+    if not cfg_path.is_file():
         log_warn(f"Config file missing at {cfg_path}; run 'cloud-dl init'.")
-        issues += 1
+        return 1
+    if os.name == "nt":
+        log_ok(f"Config loaded ({cfg_path}).")
+        return 0
+    mode = cfg_path.stat().st_mode & 0o777
+    if mode & 0o077:
+        log_warn(f"Config permissions are too open ({oct(mode)}); run 'chmod 600 {cfg_path}'.")
+        return 1
+    log_ok(f"Config loaded ({cfg_path}, mode {oct(mode)}).")
+    return 0
 
-    if cfg["aws"].get("instance_id") and cfg.get("rpc_secret"):
-        log_ok("AWS instance ID and RPC secret configured.")
+
+def _check_config_health(cfg: dict[str, Any]) -> int:
+    issues = _check_config_file_perms(Path(get_config_path()))
+    has_aws = bool(cfg["aws"].get("instance_id"))
+    if cfg.get("rpc_secret"):
+        mode_note = "AWS + OCI" if has_aws else "OCI-only mode"
+        log_ok(f"RPC secret configured ({mode_note}).")
     else:
-        log_warn("Missing AWS instance_id or rpc_secret; run 'cloud-dl init'.")
+        log_warn("Missing rpc_secret; run 'cloud-dl init'.")
         issues += 1
 
-    for tool_name in ["ssh", "aws"]:
+    tools = ["ssh", "aws"] if has_aws else ["ssh"]
+    for tool_name in tools:
         if shutil.which(tool_name):
             log_ok(f"Required tool '{tool_name}' found on PATH.")
         else:
@@ -480,8 +483,7 @@ def _check_aws_and_storage_health(cfg: dict[str, Any]) -> tuple[int, str]:
         log_warn("AWS CLI session expired (run 'aws login' or any interactive AWS cloud-dl command).")
         issues += 1
     elif st == "unconfigured":
-        log_warn("AWS instance ID not configured.")
-        issues += 1
+        log_info("AWS checks skipped (OCI-only mode).")
     else:
         log_ok(f"AWS session active ({cfg['aws']['instance_id']}: {st}).")
 
@@ -504,8 +506,7 @@ def _check_proxy_and_rpc_health(cfg: dict[str, Any], aws_state: str) -> int:
     if _is_local_port_open(socks_port):
         log_ok(f"OCI SOCKS5 proxy listening on 127.0.0.1:{socks_port}.")
     else:
-        log_warn(f"OCI SOCKS5 proxy inactive on 127.0.0.1:{socks_port} (start with 'cloud-dl browse').")
-        issues += 1
+        log_info(f"OCI SOCKS5 proxy idle on 127.0.0.1:{socks_port} (auto-starts on 'cloud-dl browse').")
 
     for c_key in ["oci", "aws"]:
         if c_key == "aws" and aws_state != "running":

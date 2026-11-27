@@ -10,7 +10,7 @@ from typing import Any
 
 from . import VERSION
 from .aws import cmd_start, cmd_stop
-from .config import Terminal, cmd_init, get_cfg, log_err
+from .config import Terminal, cmd_init, enable_windows_ansi, get_cfg, log_err
 from .cost import cmd_cost, cmd_speed, cmd_test
 from .doctor import cmd_browse, cmd_doctor, cmd_ui, cmd_watchdog
 from .exceptions import CloudDlError
@@ -201,9 +201,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_wd.add_argument("--cloud", "-c", choices=["aws", "oci"], help="Target cloud provider")
 
     p_init = subparsers.add_parser("init", help="Create or update user config.json", add_help=True)
-    p_init.add_argument("--instance-id", help="AWS EC2 instance ID")
+    p_init.add_argument("--instance-id", help="AWS EC2 instance ID (empty string for OCI-only mode)")
     p_init.add_argument("--region", help="AWS region")
     p_init.add_argument("--local-dir", help="Preferred local sync directory")
+    p_init.add_argument("--rpc-secret", help="Shared Aria2 RPC secret instead of generating a random one")
+    p_init.add_argument("--oci-ip", help="OCI VPS public IP to write into ~/.ssh/config")
+    p_init.add_argument("--aws-ip", help="AWS VPS public IP to write into ~/.ssh/config")
+    p_init.add_argument("--ssh-key", help="SSH private key path for ~/.ssh/config entries")
+    p_init.add_argument(
+        "--write-ssh-config", action="store_true", help="Write oci-vps/aws-vps aliases to ~/.ssh/config"
+    )
     p_init.add_argument("--keep-secret", action="store_true", help="Preserve existing RPC secret instead of rotating")
     p_init.add_argument("--non-interactive", action="store_true", help="Write config without interactive prompts")
 
@@ -213,6 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    enable_windows_ansi()
     signal.signal(signal.SIGINT, _sigint_handler)
     get_cfg()
     parser = build_parser()

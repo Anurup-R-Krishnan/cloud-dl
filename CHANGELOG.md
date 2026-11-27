@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.5.1] - 2026-11-27
+
+### Added
+- Friend onboarding in `cloud-dl init`: `--rpc-secret` (paste a shared token instead of regenerating), `--oci-ip`, `--aws-ip`, `--ssh-key`, and `--write-ssh-config` to scaffold `~/.ssh/config` aliases automatically, plus OCI-only mode when AWS EC2 is left blank.
+- Small-file tar batching over a single SSH stream (`--backend ssh`) for files under 5 MiB, avoiding per-file SSH handshake overhead across hundreds of small files.
+- Automatic filtering of `.aria2` sidecar files in SSH stream sync manifests and Windows-illegal character sanitization (`: * ? " < > |`) on `win32`.
+- Classic Windows console VT100 escape processing (`enable_windows_ansi()`) and `.cmd`/`.bat` AWS CLI shim fallback (`resolve_bin()`).
+
+### Changed
+- `build_ssh_base_args()` now enables `StrictHostKeyChecking=accept-new` so dynamic EC2 IP rotations and first-time friend setups succeed seamlessly on Windows OpenSSH.
+- `cloud-dl doctor` supports OCI-only setups cleanly and treats idle on-demand SOCKS5 ports as `[INFO]`.
+
 ## [2.5.0] - 2026-11-27
 
 ### Added

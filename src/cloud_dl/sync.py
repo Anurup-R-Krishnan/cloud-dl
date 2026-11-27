@@ -8,10 +8,13 @@ import hashlib
 import json
 import ntpath
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
+import threading
 import time
 import zlib
 from pathlib import Path
@@ -37,6 +40,10 @@ from .ssh import build_ssh_base_args, close_ssh_control_socket, run_ssh, update_
 TRANSIENT_RSYNC_CODES = {12, 30, 35, 255}
 RSYNC_SSH_CMD = "ssh -c aes128-gcm@openssh.com -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -o TCPKeepAlive=yes"
 SSH_STREAM_CHUNK_BYTES = 262_144
+SMALL_FILE_THRESHOLD_BYTES = 5 * 1024 * 1024
+TAR_BATCH_MAX_FILES = 200
+TAR_BATCH_MAX_BYTES = 64 * 1024 * 1024
+_WIN_ILLEGAL_CHARS = re.compile(r'[:*?"<>|]')
 
 _REMOTE_LIST_SCRIPT = (
     "import json,os,sys\n"
@@ -44,11 +51,14 @@ _REMOTE_LIST_SCRIPT = (
     "t=os.path.join(root,item) if item else root\n"
     "out=[]\n"
     "if os.path.isfile(t):\n"
-    "    out=[{'rel':os.path.basename(t),'size':os.path.getsize(t),'remote':t}]\n"
+    "    if not t.endswith('.aria2'):\n"
+    "        out=[{'rel':os.path.basename(t),'size':os.path.getsize(t),'remote':t}]\n"
     "elif os.path.isdir(t):\n"
     "    base=os.path.dirname(t.rstrip('/')) if item else t.rstrip('/')\n"
     "    for dp,_,fns in os.walk(t,followlinks=True):\n"
     "        for fn in sorted(fns):\n"
+    "            if fn.endswith('.aria2'):\n"
+    "                continue\n"
     "            fp=os.path.join(dp,fn)\n"
     "            if os.path.isfile(fp):\n"
     "                out.append({'rel':os.path.relpath(fp,base).replace(os.sep,'/'),'size':os.path.getsize(fp),'remote':fp})\n"
@@ -61,6 +71,14 @@ _REMOTE_READ_SCRIPT = (
     "with open(p,'rb') as f:\n"
     "    f.seek(off)\n"
     "    shutil.copyfileobj(f,sys.stdout.buffer,1048576)\n"
+)
+
+_REMOTE_TAR_SCRIPT = (
+    "import json,sys,tarfile\n"
+    "items=json.load(sys.stdin)\n"
+    "with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as tf:\n"
+    "    for entry in items:\n"
+    "        tf.add(entry['remote'],arcname=entry['rel'],recursive=False)\n"
 )
 
 
@@ -323,33 +341,61 @@ def build_rsync_command(
     ]
 
 
-def _parse_remote_manifest(raw_json: str, dest_root: Path) -> list[tuple[Path, int, str]]:
+def _sanitize_rel_path(rel: str) -> str:
+    clean = rel.replace("\\", "/").lstrip("/")
+    parts = [p for p in clean.split("/") if p and p != "."]
+    if not parts or ".." in parts:
+        raise SyncError(f"Unsafe relative path returned by remote host: '{rel}'")
+    if sys.platform != "win32":
+        return "/".join(parts)
+    safe_parts = [(_WIN_ILLEGAL_CHARS.sub("_", p).rstrip(" .") or "_") for p in parts]
+    return "/".join(safe_parts)
+
+
+def _parse_remote_manifest(raw_json: str, dest_root: Path) -> list[tuple[Path, int, str, str]]:
     entries = json.loads(raw_json or "[]")
     if not isinstance(entries, list):
         raise SyncError("Remote file listing returned unexpected format.")
     resolved_root = dest_root.resolve()
-    result: list[tuple[Path, int, str]] = []
+    result: list[tuple[Path, int, str, str]] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        rel = str(entry.get("rel", "")).replace("\\", "/").lstrip("/")
+        raw_rel = str(entry.get("rel", ""))
         remote_fp = str(entry.get("remote", ""))
-        size = int(entry.get("size", 0))
-        if not rel or ".." in Path(rel).parts or not remote_fp:
-            raise SyncError(f"Unsafe relative path returned by remote host: '{rel}'")
-        local_target = (resolved_root / rel).resolve()
+        if raw_rel.endswith(".aria2") or not remote_fp:
+            continue
+        safe_rel = _sanitize_rel_path(raw_rel)
+        local_target = (resolved_root / safe_rel).resolve()
         if not local_target.is_relative_to(resolved_root):
-            raise SyncError(f"Path traversal rejected in remote manifest: '{rel}'")
-        result.append((local_target, size, remote_fp))
+            raise SyncError(f"Path traversal rejected in remote manifest: '{raw_rel}'")
+        result.append((local_target, int(entry.get("size", 0)), remote_fp, safe_rel))
     return result
 
 
-def _list_remote_files_ssh(host: str, remote_dl_dir: str, item: str, dest_root: Path) -> list[tuple[Path, int, str]]:
+def _list_remote_files_ssh(
+    host: str, remote_dl_dir: str, item: str, dest_root: Path
+) -> list[tuple[Path, int, str, str]]:
     cmd = f"python3 -c {shlex.quote(_REMOTE_LIST_SCRIPT)} {shlex.quote(remote_dl_dir)} {shlex.quote(item)}"
     code, stdout, stderr = run_ssh(host, cmd, timeout=30)
     if code != 0:
         raise _TransientStreamError(f"Failed to list remote files (exit {code}): {stderr.strip()}")
     return _parse_remote_manifest(stdout, dest_root)
+
+
+def _build_ssh_stream_cmd(host: str, remote_cmd: str) -> list[str]:
+    return [
+        *build_ssh_base_args(),
+        "-T",
+        "-c",
+        "aes128-gcm@openssh.com",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=6",
+        host,
+        remote_cmd,
+    ]
 
 
 def _render_stream_progress(label: str, done: int, total: int, elapsed: float) -> None:
@@ -407,18 +453,7 @@ def _stream_single_file_ssh(host: str, remote_fp: str, local_path: Path, remote_
     action = "Resuming" if offset > 0 else "Downloading"
     log_info(f"{action} {rel_label} from byte {format_size(offset)} / {format_size(remote_size)}...")
     remote_cmd = f"python3 -c {shlex.quote(_REMOTE_READ_SCRIPT)} {shlex.quote(remote_fp)} {offset}"
-    ssh_cmd = [
-        *build_ssh_base_args(),
-        "-T",
-        "-c",
-        "aes128-gcm@openssh.com",
-        "-o",
-        "ServerAliveInterval=15",
-        "-o",
-        "ServerAliveCountMax=6",
-        host,
-        remote_cmd,
-    ]
+    ssh_cmd = _build_ssh_stream_cmd(host, remote_cmd)
     proc = subprocess.Popen(ssh_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.stdout is None or proc.stderr is None:
         raise SyncError("Failed to attach stdout/stderr pipes to SSH stream process.")
@@ -431,6 +466,100 @@ def _stream_single_file_ssh(host: str, remote_fp: str, local_path: Path, remote_
         raise _TransientStreamError(
             f"Stream interrupted for '{rel_label}' ({final_size}/{remote_size} bytes, exit {rc}: {err_out})"
         )
+
+
+def _feed_stdin_json(stdin_pipe: IO[bytes], payload: bytes) -> None:
+    try:
+        stdin_pipe.write(payload)
+    except BrokenPipeError:
+        pass
+    finally:
+        stdin_pipe.close()
+
+
+def _extract_tar_member(tf: tarfile.TarFile, member: tarfile.TarInfo, resolved_root: Path) -> None:
+    if not member.isfile():
+        return
+    safe_rel = _sanitize_rel_path(member.name)
+    local_target = (resolved_root / safe_rel).resolve()
+    if not local_target.is_relative_to(resolved_root):
+        raise SyncError(f"Path traversal rejected in tar stream: '{member.name}'")
+    local_target.parent.mkdir(parents=True, exist_ok=True)
+    src_fh = tf.extractfile(member)
+    if src_fh is None:
+        return
+    with src_fh, open(local_target, "wb") as out_fh:
+        shutil.copyfileobj(src_fh, out_fh, SSH_STREAM_CHUNK_BYTES)
+
+
+def _stream_tar_batch_ssh(host: str, batch: list[tuple[Path, int, str, str]], dest_root: Path) -> None:
+    total_bytes = sum(sz for _p, sz, _rfp, _rel in batch)
+    log_info(f"Batch-streaming {len(batch)} small file(s) ({format_size(total_bytes)}) over single SSH stream...")
+    remote_cmd = f"python3 -c {shlex.quote(_REMOTE_TAR_SCRIPT)}"
+    proc = subprocess.Popen(
+        _build_ssh_stream_cmd(host, remote_cmd),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+        raise SyncError("Failed to attach pipes to SSH batch stream process.")
+
+    payload = json.dumps([{"remote": rfp, "rel": rel} for _lp, _sz, rfp, rel in batch]).encode("utf-8")
+    writer = threading.Thread(target=_feed_stdin_json, args=(proc.stdin, payload), daemon=True)
+    writer.start()
+    resolved_root = dest_root.resolve()
+    try:
+        with tarfile.open(fileobj=proc.stdout, mode="r|") as tf:
+            for member in tf:
+                _extract_tar_member(tf, member, resolved_root)
+    except tarfile.TarError as exc:
+        proc.wait()
+        raise _TransientStreamError(f"Batch stream interrupted: {exc}") from exc
+    writer.join(timeout=2)
+    err_out = proc.stderr.read().decode("utf-8", errors="replace").strip()
+    rc = proc.wait()
+    if rc != 0:
+        raise _TransientStreamError(f"Batch stream failed (exit {rc}: {err_out})")
+    for local_path, size, _rfp, rel in batch:
+        if not local_path.is_file() or local_path.stat().st_size != size:
+            raise _TransientStreamError(f"Incomplete batched file '{rel}' after tar stream.")
+
+
+def _iter_tar_batches(items: list[tuple[Path, int, str, str]]) -> list[list[tuple[Path, int, str, str]]]:
+    batches: list[list[tuple[Path, int, str, str]]] = []
+    cur: list[tuple[Path, int, str, str]] = []
+    cur_bytes = 0
+    for item in items:
+        if cur and (len(cur) >= TAR_BATCH_MAX_FILES or cur_bytes + item[1] > TAR_BATCH_MAX_BYTES):
+            batches.append(cur)
+            cur = []
+            cur_bytes = 0
+        cur.append(item)
+        cur_bytes += item[1]
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def _partition_ssh_files(
+    files: list[tuple[Path, int, str, str]],
+) -> tuple[list[tuple[Path, int, str, str]], list[tuple[Path, int, str, str]]]:
+    small_missing: list[tuple[Path, int, str, str]] = []
+    per_file: list[tuple[Path, int, str, str]] = []
+    for entry in files:
+        local_path, size, _rfp, _rel = entry
+        local_size = local_path.stat().st_size if local_path.is_file() else 0
+        if local_size == size:
+            per_file.append(entry)
+        elif local_size == 0 and 0 < size < SMALL_FILE_THRESHOLD_BYTES:
+            small_missing.append(entry)
+        else:
+            per_file.append(entry)
+    if len(small_missing) < 2:
+        per_file = small_missing + per_file
+        small_missing = []
+    return small_missing, per_file
 
 
 def _refresh_aws_connection(cloud: str, host: str) -> None:
@@ -455,9 +584,11 @@ def _run_ssh_stream_with_retries(
             if not files:
                 log_warn("No remote files matched target.")
                 return
-            for local_path, remote_size, remote_fp in files:
-                rel_label = str(local_path.relative_to(dest_root.resolve()))
-                _stream_single_file_ssh(host, remote_fp, local_path, remote_size, rel_label)
+            small_missing, per_file = _partition_ssh_files(files)
+            for batch in _iter_tar_batches(small_missing):
+                _stream_tar_batch_ssh(host, batch, dest_root)
+            for local_path, remote_size, remote_fp, safe_rel in per_file:
+                _stream_single_file_ssh(host, remote_fp, local_path, remote_size, safe_rel)
             return
         except _TransientStreamError as exc:
             if attempt >= max_attempts:

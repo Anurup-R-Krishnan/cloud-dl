@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import json
 import os
 import secrets
@@ -14,6 +15,30 @@ from pathlib import Path
 from typing import Any
 
 from .exceptions import ConfigError
+
+
+def enable_windows_ansi() -> None:
+    """Enable VT100 escape processing in classic Windows conhost consoles."""
+    if sys.platform != "win32":
+        return
+    kernel32 = getattr(ctypes, "windll", None)
+    if kernel32 is None:
+        return
+    for handle_id in (-11, -12):
+        with contextlib.suppress(OSError, AttributeError):
+            handle = kernel32.kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_ulong()
+            if handle and kernel32.kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+
+
+def resolve_bin(name: str) -> str:
+    """Resolve Windows .cmd/.bat shims cleanly while keeping standard command names."""
+    if sys.platform == "win32":
+        found = shutil.which(name)
+        if found and found.lower().endswith((".cmd", ".bat")):
+            return found
+    return name
 
 
 def get_config_dir() -> Path:
@@ -218,43 +243,161 @@ def _prompt_with_default(label: str, current_val: Any) -> str:
     return raw if raw else str(current_val)
 
 
-def _prompt_init_values(current: dict[str, Any], cfg_path: Path) -> None:
+def detect_default_ssh_key() -> str | None:
+    ssh_dir = Path.home() / ".ssh"
+    for name in ("oci_vps", "id_ed25519", "id_rsa"):
+        candidate = ssh_dir / name
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _build_ssh_host_block(alias: str, host_ip: str, key_path: str | None) -> str:
+    lines = [
+        f"Host {alias}",
+        f"  HostName {host_ip or f'<{alias.upper()}_IP>'}",
+        "  User ubuntu",
+    ]
+    if key_path:
+        lines.append(f"  IdentityFile {key_path}")
+    if alias == "aws-vps":
+        lines.extend(["  Ciphers aes128-gcm@openssh.com,chacha20-poly1305@openssh.com"])
+    lines.extend(["  ServerAliveInterval 15", "  ServerAliveCountMax 8", "  StrictHostKeyChecking accept-new"])
+    return "\n".join(lines) + "\n"
+
+
+def _ssh_config_has_host(lines: list[str], alias: str) -> bool:
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower().startswith("host ") and alias in stripped.split()[1:]:
+            return True
+    return False
+
+
+def _replace_ssh_host_ip(lines: list[str], alias: str, new_ip: str) -> list[str]:
+    in_block = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith("host "):
+            in_block = alias in stripped.split()[1:]
+            out.append(line)
+            continue
+        if in_block and lower.startswith("hostname "):
+            indent = line[: len(line) - len(line.lstrip())]
+            out.append(f"{indent}HostName {new_ip}\n")
+            continue
+        out.append(line)
+    return out
+
+
+def setup_ssh_config_aliases(
+    *,
+    oci_ip: str | None = None,
+    aws_ip: str | None = None,
+    key_path: str | None = None,
+    ssh_config_path: Path | None = None,
+) -> tuple[Path, list[str]]:
+    """Create or update oci-vps/aws-vps host blocks in ~/.ssh/config without clobbering existing settings."""
+    target = ssh_config_path or (Path.home() / ".ssh" / "config")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        with contextlib.suppress(OSError):
+            os.chmod(target.parent, 0o700)
+
+    existing = target.read_text(encoding="utf-8") if target.is_file() else ""
+    lines = existing.splitlines(keepends=True)
+    detected_key = key_path or detect_default_ssh_key()
+    updated_hosts: list[str] = []
+
+    for alias, ip_val in (("oci-vps", oci_ip), ("aws-vps", aws_ip)):
+        if _ssh_config_has_host(lines, alias):
+            if ip_val:
+                lines = _replace_ssh_host_ip(lines, alias, ip_val)
+                updated_hosts.append(alias)
+        elif ip_val or not existing:
+            if lines and not lines[-1].endswith("\n"):
+                lines.append("\n")
+            if lines:
+                lines.append("\n")
+            lines.append(_build_ssh_host_block(alias, ip_val or "", detected_key))
+            updated_hosts.append(alias)
+
+    target.write_text("".join(lines), encoding="utf-8")
+    if os.name != "nt":
+        with contextlib.suppress(OSError):
+            os.chmod(target, 0o600)
+    return target, updated_hosts
+
+
+def _prompt_init_values(
+    current: dict[str, Any], cfg_path: Path
+) -> tuple[str | None, str | None, str | None, bool, bool]:
     sys.stdout.write(f"\n{Terminal.BOLD}cloud-dl Configuration Setup ({cfg_path}){Terminal.RESET}\n")
     sys.stdout.write("-" * 60 + "\n")
-    current["aws"]["instance_id"] = _prompt_with_default("AWS EC2 Instance ID", current["aws"]["instance_id"])
-    current["aws"]["region"] = _prompt_with_default("AWS Region", current["aws"]["region"])
-    current["preferred_local_dir"] = _prompt_with_default("Preferred local sync drive", current["preferred_local_dir"])
-    current["aws"]["compute_per_hr"] = float(
-        _prompt_with_default("EC2 compute USD/hour", current["aws"]["compute_per_hr"])
+    current["aws"]["instance_id"] = _prompt_with_default(
+        "AWS EC2 Instance ID (blank for OCI-only mode)", current["aws"]["instance_id"]
     )
-    current["aws"]["credit_balance_usd"] = float(
-        _prompt_with_default("Credit balance USD", current["aws"]["credit_balance_usd"])
-    )
+    if current["aws"]["instance_id"]:
+        current["aws"]["region"] = _prompt_with_default("AWS Region", current["aws"]["region"])
+        current["aws"]["compute_per_hr"] = float(
+            _prompt_with_default("EC2 compute USD/hour", current["aws"]["compute_per_hr"])
+        )
+        current["aws"]["credit_balance_usd"] = float(
+            _prompt_with_default("Credit balance USD", current["aws"]["credit_balance_usd"])
+        )
+    current["preferred_local_dir"] = _prompt_with_default("Preferred local sync folder", current["preferred_local_dir"])
+    shared_secret = input("Shared Aria2 RPC secret (leave blank to auto-generate/keep): ").strip()
+    if shared_secret:
+        current["rpc_secret"] = shared_secret
+    oci_ip = input("OCI VPS public IP for ~/.ssh/config (leave blank to skip): ").strip() or None
+    aws_ip = input("AWS VPS public IP for ~/.ssh/config (leave blank to skip): ").strip() or None
+    default_key = detect_default_ssh_key() or ""
+    key_input = input(f"SSH private key path [{default_key}]: ").strip()
+    key_path = key_input or (default_key or None)
+    write_ssh = bool(oci_ip or aws_ip) or not (Path.home() / ".ssh" / "config").is_file()
+    return oci_ip, aws_ip, key_path, write_ssh, bool(shared_secret)
 
 
-def cmd_init(args: argparse.Namespace) -> None:
-    """Create or update user config.json with randomized RPC credentials."""
-    cfg_path = Path(get_config_path())
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    current = deep_merge(build_default_config(), get_cfg())
-
-    if getattr(args, "instance_id", None):
+def _apply_init_flags(current: dict[str, Any], args: argparse.Namespace) -> bool:
+    if getattr(args, "instance_id", None) is not None:
         current["aws"]["instance_id"] = args.instance_id.strip()
     if getattr(args, "region", None):
         current["aws"]["region"] = args.region.strip()
     if getattr(args, "local_dir", None):
         current["preferred_local_dir"] = args.local_dir.strip()
+    explicit_secret = getattr(args, "rpc_secret", None)
+    if explicit_secret:
+        current["rpc_secret"] = explicit_secret.strip()
+        return True
+    return False
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    """Create or update user config.json with shared or generated RPC credentials and SSH aliases."""
+    cfg_path = Path(get_config_path())
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    current = deep_merge(build_default_config(), get_cfg())
+    secret_supplied = _apply_init_flags(current, args)
+
+    oci_ip = getattr(args, "oci_ip", None)
+    aws_ip = getattr(args, "aws_ip", None)
+    key_path = getattr(args, "ssh_key", None)
+    write_ssh = bool(getattr(args, "write_ssh_config", False) or oci_ip or aws_ip)
 
     if not getattr(args, "non_interactive", False):
         try:
-            _prompt_init_values(current, cfg_path)
+            oci_ip, aws_ip, key_path, prompt_ssh, prompt_secret = _prompt_init_values(current, cfg_path)
+            write_ssh = write_ssh or prompt_ssh
+            secret_supplied = secret_supplied or prompt_secret
         except (KeyboardInterrupt, EOFError) as exc:
             raise ConfigError("Initialization canceled.") from exc
         except ValueError as exc:
             raise ConfigError(f"Invalid numeric value provided: {exc}") from exc
 
     rotated = False
-    if not getattr(args, "keep_secret", False) or not current.get("rpc_secret"):
+    if not secret_supplied and (not getattr(args, "keep_secret", False) or not current.get("rpc_secret")):
         current["rpc_secret"] = secrets.token_hex(16)
         rotated = True
 
@@ -264,6 +407,10 @@ def cmd_init(args: argparse.Namespace) -> None:
     reload_config(str(cfg_path))
     perm_msg = "permissions 0600" if os.name != "nt" else "user profile scope"
     log_ok(f"Saved configuration to {cfg_path} ({perm_msg}).")
+    if write_ssh:
+        ssh_path, aliases = setup_ssh_config_aliases(oci_ip=oci_ip, aws_ip=aws_ip, key_path=key_path)
+        if aliases:
+            log_ok(f"Configured SSH aliases ({', '.join(aliases)}) in {ssh_path}.")
     if rotated:
         log_info("Generated a new 32-char RPC secret in config.json.")
-        log_info("Sync the updated `rpc-secret` in ~/.aria2/aria2.conf on both VPS nodes and restart aria2c.")
+        log_info("Sync `rpc-secret` in ~/.aria2/aria2.conf on your VPS nodes and restart aria2c.")

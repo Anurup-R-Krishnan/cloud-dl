@@ -510,3 +510,120 @@ def test_browse_launches_edge_with_socks5_and_isolated_profile(tmp_path: Path) -
     assert "--proxy-server=socks5://127.0.0.1:1080" in launched_cmd
     assert any(arg.startswith("--user-data-dir=") for arg in launched_cmd)
     assert "https://example.com" in launched_cmd
+
+
+def test_init_shared_secret_and_ssh_config_aliases(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "cfg" / "config.json"
+    ssh_cfg = tmp_path / "ssh" / "config"
+    reset_test_cfg(cfg_file)
+    args = cli.build_parser().parse_args(
+        [
+            "init",
+            "--instance-id",
+            "",
+            "--rpc-secret",
+            "sharedfriendtoken1234",
+            "--local-dir",
+            str(tmp_path),
+            "--non-interactive",
+        ]
+    )
+    config.cmd_init(args)
+    saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert saved["rpc_secret"] == "sharedfriendtoken1234"
+    assert saved["aws"]["instance_id"] == ""
+
+    written_path, added = config.setup_ssh_config_aliases(
+        oci_ip="203.0.113.44", key_path="/tmp/key", ssh_config_path=ssh_cfg
+    )
+    assert written_path == ssh_cfg
+    assert "oci-vps" in added
+    text = ssh_cfg.read_text(encoding="utf-8")
+    assert "HostName 203.0.113.44" in text
+    assert "StrictHostKeyChecking accept-new" in text
+
+    # Second run updates HostName without duplicating blocks
+    _, updated = config.setup_ssh_config_aliases(oci_ip="203.0.113.99", ssh_config_path=ssh_cfg)
+    assert "oci-vps" in updated
+    text2 = ssh_cfg.read_text(encoding="utf-8")
+    assert text2.count("Host oci-vps") == 1
+    assert "HostName 203.0.113.99" in text2
+
+
+def test_doctor_oci_only_mode_healthy_when_socks_idle(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        json.dumps({"aws": {"instance_id": ""}, "rpc_secret": "s" * 16, "preferred_local_dir": str(tmp_path)}),
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        os.chmod(cfg_file, 0o600)
+    reset_test_cfg(cfg_file)
+    with (
+        patch.object(doctor, "get_aws_state", return_value="unconfigured"),
+        patch.object(doctor.os.path, "ismount", return_value=True),
+        patch.object(doctor.shutil, "which", return_value="ssh"),
+        patch.object(doctor, "_is_local_port_open", return_value=False),
+        patch.object(doctor, "query_status_payload", return_value=([], [], [], "", None)),
+    ):
+        doctor.cmd_doctor(None)
+    captured = capsys.readouterr()
+    assert "All subsystems healthy." in (captured.out + captured.err)
+
+
+def test_parse_remote_manifest_skips_aria2_and_sanitizes_windows_chars(tmp_path: Path) -> None:
+    manifest = json.dumps(
+        [
+            {"rel": "Game/data.bin", "size": 100, "remote": "/dl/Game/data.bin"},
+            {"rel": "Game/data.bin.aria2", "size": 50, "remote": "/dl/Game/data.bin.aria2"},
+            {"rel": "Game/Read:Me?.txt ", "size": 12, "remote": "/dl/Game/Read:Me?.txt "},
+        ]
+    )
+    with patch.object(sync.sys, "platform", "win32"):
+        parsed = sync._parse_remote_manifest(manifest, tmp_path)
+    rels = [entry[3] for entry in parsed]
+    assert "Game/data.bin" in rels
+    assert all(not r.endswith(".aria2") for r in rels)
+    assert "Game/Read_Me_.txt" in rels
+
+
+def test_ssh_stream_batches_small_files_via_tar(tmp_path: Path) -> None:
+    import io
+    import tarfile
+
+    dest_dir = tmp_path / "out"
+    dest_dir.mkdir()
+    files_data = {"pkg/a.txt": b"alpha", "pkg/sub/b.nfo": b"beta-info", "pkg/c.ini": b"[cfg]\n"}
+    tar_buf = io.BytesIO()
+    with tarfile.open(fileobj=tar_buf, mode="w|") as tf:
+        for rel, body in files_data.items():
+            info = tarfile.TarInfo(name=rel)
+            info.size = len(body)
+            tf.addfile(info, io.BytesIO(body))
+    tar_bytes = tar_buf.getvalue()
+
+    manifest = json.dumps([{"rel": rel, "size": len(body), "remote": f"/dl/{rel}"} for rel, body in files_data.items()])
+
+    class _FakeTarProc:
+        def __init__(self) -> None:
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO(tar_bytes)
+            self.stderr = io.BytesIO(b"")
+
+        def wait(self) -> int:
+            return 0
+
+    with (
+        patch.object(sync, "run_ssh", return_value=(0, manifest, "")),
+        patch.object(sync.subprocess, "Popen", return_value=_FakeTarProc()) as mock_popen,
+    ):
+        sync._run_ssh_stream_with_retries("oci-vps", "oci", "/dl", "pkg", str(dest_dir), 2)
+
+    assert mock_popen.call_count == 1
+    for rel, body in files_data.items():
+        assert (dest_dir / rel).read_bytes() == body
+
+
+def test_ssh_base_args_include_accept_new() -> None:
+    args_str = " ".join(ssh.build_ssh_base_args())
+    assert "StrictHostKeyChecking=accept-new" in args_str

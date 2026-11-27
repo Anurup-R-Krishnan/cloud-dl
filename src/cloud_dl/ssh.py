@@ -39,6 +39,8 @@ def build_ssh_base_args() -> list[str]:
         "-o",
         "BatchMode=yes",
         "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
         "LogLevel=ERROR",
     ]
     if sys.platform != "win32":

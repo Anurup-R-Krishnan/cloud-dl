@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 
-from .config import Terminal, get_cfg, log_err, log_info, log_ok, log_warn
+from .config import Terminal, get_cfg, log_err, log_info, log_ok, log_warn, resolve_bin
 from .exceptions import AuthError, CloudDlError, ConfigError
 from .ssh import close_ssh_control_socket, is_aws_auth_error, run_ssh, update_ssh_config_ip
 
@@ -19,7 +19,7 @@ def get_aws_state() -> str:
         return "unconfigured"
     try:
         cmd = [
-            "aws",
+            resolve_bin("aws"),
             "ec2",
             "describe-instances",
             "--instance-ids",
@@ -48,7 +48,7 @@ def get_aws_public_ip() -> str | None:
         return None
     try:
         cmd = [
-            "aws",
+            resolve_bin("aws"),
             "ec2",
             "describe-instances",
             "--instance-ids",
@@ -80,13 +80,13 @@ def ensure_aws_auth(auto_login: bool = True) -> bool:
         return False
 
     log_info("AWS session expired. Opening browser for 'aws login'...")
-    login_res = subprocess.run(["aws", "login"], check=False, timeout=300)
+    login_res = subprocess.run([resolve_bin("aws"), "login"], check=False, timeout=300)
     if login_res.returncode != 0:
         log_err("AWS login did not complete successfully.")
         return False
 
     verify_res = subprocess.run(
-        ["aws", "sts", "get-caller-identity"],
+        [resolve_bin("aws"), "sts", "get-caller-identity"],
         check=False,
         capture_output=True,
         text=True,
@@ -116,7 +116,7 @@ def stop_aws_instance(auto_login: bool = True) -> bool:
     log_info(f"Stopping {cfg['aws']['name']} instance ({instance_id})...")
     res = subprocess.run(
         [
-            "aws",
+            resolve_bin("aws"),
             "ec2",
             "stop-instances",
             "--instance-ids",
@@ -142,7 +142,7 @@ def stop_aws_instance(auto_login: bool = True) -> bool:
 
 def _boot_ec2_and_wait(instance_id: str, region: str, name: str) -> bool:
     log_info(f"Starting {name} EC2 instance ({instance_id})...")
-    cmd = ["aws", "ec2", "start-instances", "--instance-ids", instance_id, "--region", region]
+    cmd = [resolve_bin("aws"), "ec2", "start-instances", "--instance-ids", instance_id, "--region", region]
     res = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=15)
     if res.returncode != 0:
         msg = (

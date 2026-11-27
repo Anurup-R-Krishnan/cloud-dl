@@ -10,7 +10,7 @@ import time
 from datetime import UTC, datetime
 
 from .aws import ensure_aws_auth, get_aws_state
-from .config import Terminal, get_cfg
+from .config import Terminal, get_cfg, resolve_bin
 from .ssh import get_disk_free, is_aws_auth_error, run_ssh
 
 
@@ -79,7 +79,7 @@ def _query_cost_explorer() -> str:
     try:
         ce_res = subprocess.run(
             [
-                "aws",
+                resolve_bin("aws"),
                 "ce",
                 "get-cost-and-usage",
                 "--time-period",
@@ -113,7 +113,7 @@ def _query_ec2_uptime(instance_id: str, region: str) -> tuple[float, str]:
     try:
         ec2_res = subprocess.run(
             [
-                "aws",
+                resolve_bin("aws"),
                 "ec2",
                 "describe-instances",
                 "--instance-ids",

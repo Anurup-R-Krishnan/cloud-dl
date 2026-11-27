@@ -110,11 +110,9 @@ winget install Python.Python.3.13 astral-sh.uv Amazon.AWSCLI
 # Restart PowerShell so PATH updates take effect, then install cloud-dl directly from GitHub:
 uv tool install git+https://github.com/Anurup-R-Krishnan/cloud-dl.git
 
-# 2. Place your SSH private key + config into C:\Users\<YourName>\.ssh\config
-# (See configs/ssh_config_snippet.txt; uses built-in Windows ssh.exe)
-
-# 3. Run first-time setup and diagnostics:
-cloud-dl init
+# 2. Configure SSH + shared RPC secret automatically (no manual file editing):
+cloud-dl init --instance-id "" --rpc-secret "<SHARED_SECRET>" --oci-ip "<OCI_IP>" --ssh-key "$env:USERPROFILE\.ssh\oci_vps" --non-interactive
+# (Or run interactive `cloud-dl init` to set up AWS + OCI together)
 cloud-dl doctor
 
 # 4. Everyday commands (all native in PowerShell):
