@@ -6,6 +6,7 @@ import argparse
 import ctypes
 import hashlib
 import json
+import ntpath
 import os
 import shlex
 import shutil
@@ -106,7 +107,7 @@ def get_filesystem_type(path: str) -> str:
 def _resolve_windows_dest(dest_override: str | None, preferred: str) -> str:
     downloads = str(Path.home() / "Downloads")
     target = dest_override or preferred or downloads
-    drive = Path(target).drive
+    drive = ntpath.splitdrive(target)[0]
     if drive and not os.path.exists(f"{drive}\\"):
         if dest_override:
             raise SyncError(f"Destination drive '{drive}' is not connected.")

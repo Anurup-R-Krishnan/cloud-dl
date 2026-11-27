@@ -95,7 +95,19 @@ def test_cmd_sync_transient_retry_then_succeeds(tmp_path: Path) -> None:
     reset_test_cfg()
     config.CFG["aws"]["instance_id"] = "i-test0001"
     args = cli.build_parser().parse_args(
-        ["sync", "sample-pkg", "--cloud", "aws", "--dest", str(tmp_path), "--retries", "2", "--no-clean"]
+        [
+            "sync",
+            "sample-pkg",
+            "--cloud",
+            "aws",
+            "--backend",
+            "rsync",
+            "--dest",
+            str(tmp_path),
+            "--retries",
+            "2",
+            "--no-clean",
+        ]
     )
     calls: list[list[str]] = []
 
@@ -107,6 +119,7 @@ def test_cmd_sync_transient_retry_then_succeeds(tmp_path: Path) -> None:
         return subprocess.CompletedProcess(cmd, 0, "running\n", "")
 
     with (
+        patch.object(sync.shutil, "which", return_value="/usr/bin/rsync"),
         patch.object(sync, "require_aws_auth"),
         patch.object(sync, "get_aws_state", return_value="running"),
         patch.object(sync, "get_aws_public_ip", return_value="203.0.113.9"),
@@ -212,9 +225,22 @@ def test_cmd_sync_verify_and_stop_after_flow(tmp_path: Path) -> None:
     (pkg / "check.md5").write_text(f"{hashlib.md5(b'valid').hexdigest()}  data.bin\n", encoding="utf-8")
 
     args = cli.build_parser().parse_args(
-        ["sync", "pkg", "--cloud", "aws", "--dest", str(tmp_path), "--verify", "--stop-after", "--no-clean"]
+        [
+            "sync",
+            "pkg",
+            "--cloud",
+            "aws",
+            "--backend",
+            "rsync",
+            "--dest",
+            str(tmp_path),
+            "--verify",
+            "--stop-after",
+            "--no-clean",
+        ]
     )
     with (
+        patch.object(sync.shutil, "which", return_value="/usr/bin/rsync"),
         patch.object(sync, "require_aws_auth"),
         patch.object(sync, "get_aws_state", return_value="running"),
         patch.object(sync, "send_notification"),
@@ -368,6 +394,7 @@ def test_build_rsync_command_exfat_and_append_flags() -> None:
 
 def test_sync_unmounted_preferred_target_raises_sync_error() -> None:
     reset_test_cfg()
+    config.CFG["preferred_local_dir"] = "/mnt/DATA"
     with (
         patch.object(sync.sys, "platform", "linux"),
         patch.object(sync.os.path, "ismount", return_value=False),
@@ -375,6 +402,14 @@ def test_sync_unmounted_preferred_target_raises_sync_error() -> None:
         pytest.raises(exceptions.SyncError),
     ):
         sync.ensure_local_dest_mounted("/mnt/DATA")
+
+
+def test_windows_disconnected_override_drive_raises_sync_error() -> None:
+    reset_test_cfg()
+    with patch.object(sync.os.path, "exists", return_value=False):
+        assert sync._resolve_windows_dest(None, r"Z:\Media") == str(Path.home() / "Downloads")
+        with pytest.raises(exceptions.SyncError):
+            sync._resolve_windows_dest(r"Z:\Media", r"Z:\Media")
 
 
 def test_resolve_sync_backend_selects_ssh_on_windows_and_when_rsync_missing() -> None:
